@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "FleetApp",
+  "outputfilename": "FleetApp",
+  "frontend:install": "true",
+  "frontend:build": "true",
+  "frontend:dev:watcher": "true",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Garrett Kirschbaum",
+    "email": "ibekidkirsch@gmail.com"
+  }
+}
