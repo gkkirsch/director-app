@@ -1,7 +1,7 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "FleetApp",
-  "outputfilename": "FleetApp",
+  "name": "Flow",
+  "outputfilename": "Flow",
   "frontend:install": "true",
   "frontend:build": "true",
   "frontend:dev:watcher": "true",
