@@ -31,23 +31,30 @@ jobs:
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
-      # The four satellites (roster, camux, amux, fleetview) each ship
-      # darwin/arm64 tarballs as `<repo>_darwin_<arch>.tar.gz` from their
-      # own goreleaser pipelines. We pull the latest release of each and
-      # hand the binaries to build.sh via $FLEETVIEW / $ROSTER / etc.
+      # The four satellites each ship darwin/arm64 tarballs from their
+      # own goreleaser pipelines. Repo name, tarball name, and binary
+      # name don't always match (e.g. fleetview lives in gkkirsch/fleet
+      # and ships as fleet_*.tar.gz with `fleetview` inside) so we use
+      # an explicit mapping: "<repo>:<binary>" per line.
       - name: Fetch satellite binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p satellites
-          for repo in roster camux amux fleetview; do
+          while IFS=: read -r repo binary; do
+            [[ -z "$repo" ]] && continue
             url="https://github.com/${OWNER}/${repo}/releases/latest/download/${repo}_darwin_${ARCH}.tar.gz"
-            echo "→ $url"
+            echo "→ $url  (extracts ${binary})"
             curl -fsSL "$url" -o "/tmp/${repo}.tgz"
-            tar -xzf "/tmp/${repo}.tgz" -C satellites
-            chmod +x "satellites/${repo}"
-          done
+            tar -xzf "/tmp/${repo}.tgz" -C satellites "${binary}"
+            chmod +x "satellites/${binary}"
+          done <<'EOF'
+          roster:roster
+          camux:camux
+          amux:amux
+          fleet:fleetview
+          EOF
           ls -la satellites
 
       - name: Build Flow.app
