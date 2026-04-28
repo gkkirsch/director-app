@@ -1,0 +1,80 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    env:
+      OWNER: gkkirsch
+      ARCH: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      # The four satellites (roster, camux, amux, fleetview) each ship
+      # darwin/arm64 tarballs as `<repo>_darwin_<arch>.tar.gz` from their
+      # own goreleaser pipelines. We pull the latest release of each and
+      # hand the binaries to build.sh via $FLEETVIEW / $ROSTER / etc.
+      - name: Fetch satellite binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p satellites
+          for repo in roster camux amux fleetview; do
+            url="https://github.com/${OWNER}/${repo}/releases/latest/download/${repo}_darwin_${ARCH}.tar.gz"
+            echo "→ $url"
+            curl -fsSL "$url" -o "/tmp/${repo}.tgz"
+            tar -xzf "/tmp/${repo}.tgz" -C satellites
+            chmod +x "satellites/${repo}"
+          done
+          ls -la satellites
+
+      - name: Build Flow.app
+        env:
+          FLEETVIEW: ${{ github.workspace }}/satellites/fleetview
+          ROSTER:    ${{ github.workspace }}/satellites/roster
+          CAMUX:     ${{ github.workspace }}/satellites/camux
+          AMUX:      ${{ github.workspace }}/satellites/amux
+        run: |
+          # build.sh calls `~/go/bin/wails build`. The `setup-go` step
+          # places the binary there via `go install` above.
+          ./build.sh
+
+      - name: Package Flow.app.zip
+        run: |
+          cd build/bin
+          # `ditto -ck` preserves macOS metadata + symlinks across the
+          # zip boundary; plain `zip` strips them and breaks the bundle.
+          ditto -ck --keepParent --sequesterRsrc Flow.app Flow.app.zip
+          shasum -a 256 Flow.app.zip > Flow.app.zip.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/bin/Flow.app.zip
+            build/bin/Flow.app.zip.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
