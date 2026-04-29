@@ -35,6 +35,16 @@ const (
 
 func main() {
 	bootstrapPATH()
+	// Chdir to ~/Flow at startup. Finder/Dock-launched .apps inherit
+	// cwd=/ from launchd, and any subprocess we fork (fleetview,
+	// `roster spawn` from ensureDispatcher) inherits it too. That
+	// turns every \$PWD-relative write inside an agent into a
+	// "/file: read-only" error. Anchor the whole process tree at
+	// the writable Flow data dir.
+	dataDir := flowDataDir()
+	if err := os.MkdirAll(dataDir, 0o755); err == nil {
+		_ = os.Chdir(dataDir)
+	}
 
 	backend, _ := url.Parse(backendURL)
 	proxy := httputil.NewSingleHostReverseProxy(backend)
