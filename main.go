@@ -322,21 +322,19 @@ func checkPrereqs() []prereq {
 			DocsURL: "https://github.com/tmux/tmux/wiki/Installing",
 		})
 	}
-	if _, err := exec.LookPath("node"); err != nil {
+	// Note: node is intentionally NOT a hard prereq anymore. The
+	// official Claude Code installer is self-contained (drops a native
+	// binary at ~/.local/bin/claude), and Flow's other parts don't
+	// need node directly. agent-browser is a separate npm install
+	// triggered later only if the user opts into it.
+	claudePath := findClaude()
+	if claudePath == "" {
 		missing = append(missing, prereq{
-			ID:      "node",
-			Label:   "Node.js",
-			Why:     "Required by the Claude Code CLI and agent-browser.",
-			Fix:     "brew install node",
-			DocsURL: "https://nodejs.org/en/download",
-		})
-	}
-	if _, err := exec.LookPath("claude"); err != nil {
-		missing = append(missing, prereq{
-			ID:      "claude",
-			Label:   "Claude Code CLI",
-			Why:     "The CLI Flow drives. Install it, then run `claude` once and complete the login flow.",
-			Fix:     "npm install -g @anthropic-ai/claude-code",
+			ID:    "claude",
+			Label: "Claude Code CLI",
+			Why:   "The CLI Flow drives. The official installer drops a native binary into ~/.local/bin and works without Node.",
+			Fix:   "curl -fsSL https://claude.ai/install.sh | bash",
+			Note:  "After install, run `claude` once and complete the login flow before clicking Recheck.",
 			DocsURL: "https://docs.claude.com/en/docs/claude-code/installation",
 		})
 	} else if !claudeAuthenticated() {
@@ -349,6 +347,42 @@ func checkPrereqs() []prereq {
 		})
 	}
 	return missing
+}
+
+// findClaude searches PATH first, then common install locations the
+// official installer / npm-via-various-node-managers drop the binary
+// into. Returns the absolute path on success, "" on miss. As a side
+// effect, when found via fallback, prepends the binary's dir to PATH
+// so subprocess spawns also see it without the user having to edit
+// their shell rc.
+func findClaude() string {
+	if p, err := exec.LookPath("claude"); err == nil {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(home, ".local/bin/claude"),         // Anthropic native installer
+		filepath.Join(home, ".npm-global/bin/claude"),    // npm with custom prefix
+		filepath.Join(home, ".asdf/shims/claude"),        // asdf
+		filepath.Join(home, ".volta/bin/claude"),         // volta
+		filepath.Join(home, ".fnm/aliases/default/bin/claude"), // fnm
+		"/opt/homebrew/bin/claude",                        // Homebrew (Apple Silicon)
+		"/usr/local/bin/claude",                           // Homebrew (Intel) / legacy
+	}
+	for _, p := range candidates {
+		fi, err := os.Stat(p)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		if fi.Mode()&0o111 == 0 {
+			continue // not executable
+		}
+		// Prepend the dir to PATH so future subprocesses see it too.
+		dir := filepath.Dir(p)
+		os.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+		return p
+	}
+	return ""
 }
 
 // claudeAuthenticated returns true if the user has a Claude Code
