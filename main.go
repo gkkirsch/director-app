@@ -361,6 +361,12 @@ func claudeAuthenticated() bool {
 }
 
 func (a *appState) recheckHandler(w http.ResponseWriter, r *http.Request) {
+	// Re-bootstrap PATH every time. The user might have just finished
+	// `brew install node` or the claude installer (which appends to
+	// ~/.zshrc), and the dirs they added won't be in the PATH we
+	// captured at startup. Sourcing the login shell again picks up
+	// any rc-file edits.
+	bootstrapPATH()
 	missing := checkPrereqs()
 	resp := struct {
 		Missing []prereq `json:"missing"`
