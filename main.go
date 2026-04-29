@@ -138,6 +138,16 @@ func (a *appState) startFleetview() error {
 	cmd := exec.CommandContext(context.Background(), bin)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
+	// Force a sensible cwd. When the .app is launched by Finder/Dock,
+	// fleetview otherwise inherits "/" — and every subsequent
+	// `roster spawn` (called by the dispatcher / orchestrators) inherits
+	// that too, which means agents try to mkdir under "/" and hit
+	// "Read-only file system." Anchor everything at ~/Flow so artifacts
+	// land somewhere writable and discoverable.
+	cmd.Dir = flowDataDir()
+	if err := os.MkdirAll(cmd.Dir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "fleet-app: mkdir %s: %v\n", cmd.Dir, err)
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start fleetview: %w", err)
 	}
@@ -161,6 +171,17 @@ func (a *appState) shutdown() {
 		_ = a.cmd.Process.Signal(os.Interrupt)
 		_, _ = a.cmd.Process.Wait()
 	}
+}
+
+// flowDataDir is where Flow's spawned agents live and write things.
+// Defaults to ~/Flow. Honors $FLOW_HOME if set so users can move the
+// data dir elsewhere without recompiling.
+func flowDataDir() string {
+	if d := os.Getenv("FLOW_HOME"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Flow")
 }
 
 // findFleetview prefers the sibling binary inside the .app bundle
