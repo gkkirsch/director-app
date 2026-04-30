@@ -1,7 +1,7 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "Flow",
-  "outputfilename": "Flow",
+  "name": "Director",
+  "outputfilename": "Director",
   "frontend:install": "true",
   "frontend:build": "true",
   "frontend:dev:watcher": "true",

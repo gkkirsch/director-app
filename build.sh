@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the Flow.app bundle with fleetview + satellites baked in.
+# Build the Director.app bundle with fleetview + satellites baked in.
 #
 # We pull every binary fleet runs (roster, camux, amux, fleetview) into
 # Contents/MacOS/. main.go prepends that dir to PATH before spawning
@@ -45,7 +45,7 @@ done
 # Build the wrapper.
 ~/go/bin/wails build
 
-APP="build/bin/Flow.app"
+APP="build/bin/Director.app"
 MACOS="$APP/Contents/MacOS"
 
 for bin in "$FLEETVIEW" "$ROSTER" "$CAMUX" "$AMUX"; do

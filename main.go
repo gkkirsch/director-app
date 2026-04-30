@@ -60,7 +60,7 @@ func main() {
 	mux.HandleFunc("/", app.dispatch)
 
 	err := wails.Run(&options.App{
-		Title:     "Flow",
+		Title:     "Director",
 		Width:     1280,
 		Height:    820,
 		MinWidth:  720,
@@ -142,9 +142,9 @@ func (a *appState) startFleetview() error {
 	// fleetview otherwise inherits "/" — and every subsequent
 	// `roster spawn` (called by the dispatcher / orchestrators) inherits
 	// that too, which means agents try to mkdir under "/" and hit
-	// "Read-only file system." Anchor everything at ~/Flow so artifacts
-	// land somewhere writable and discoverable.
-	cmd.Dir = flowDataDir()
+	// "Read-only file system." Anchor everything at the data dir so
+	// artifacts land somewhere writable and discoverable.
+	cmd.Dir = directorDataDir()
 	if err := os.MkdirAll(cmd.Dir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "fleet-app: mkdir %s: %v\n", cmd.Dir, err)
 	}
@@ -173,15 +173,21 @@ func (a *appState) shutdown() {
 	}
 }
 
-// flowDataDir is where Flow's spawned agents live and write things.
-// Defaults to ~/Flow. Honors $FLOW_HOME if set so users can move the
-// data dir elsewhere without recompiling.
-func flowDataDir() string {
+// directorDataDir is where Director's spawned agents live and write
+// things. Defaults to ~/Library/Application Support/Director (proper
+// macOS convention — not visible in Finder's home view, survives the
+// app being moved). Honors $DIRECTOR_HOME for users who want to move
+// it. Also accepts $FLOW_HOME for backwards compat with installs that
+// set it before the rename.
+func directorDataDir() string {
+	if d := os.Getenv("DIRECTOR_HOME"); d != "" {
+		return d
+	}
 	if d := os.Getenv("FLOW_HOME"); d != "" {
 		return d
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Flow")
+	return filepath.Join(home, "Library", "Application Support", "Director")
 }
 
 // findFleetview prefers the sibling binary inside the .app bundle
@@ -338,14 +344,14 @@ func checkPrereqs() []prereq {
 		missing = append(missing, prereq{
 			ID:      "tmux",
 			Label:   "tmux",
-			Why:     "Flow runs each agent in its own tmux session.",
+			Why:     "Director runs each agent in its own tmux session.",
 			Fix:     "brew install tmux",
 			DocsURL: "https://github.com/tmux/tmux/wiki/Installing",
 		})
 	}
 	// Note: node is intentionally NOT a hard prereq anymore. The
 	// official Claude Code installer is self-contained (drops a native
-	// binary at ~/.local/bin/claude), and Flow's other parts don't
+	// binary at ~/.local/bin/claude), and Director's other parts don't
 	// need node directly. agent-browser is a separate npm install
 	// triggered later only if the user opts into it.
 	claudePath := findClaude()
@@ -353,7 +359,7 @@ func checkPrereqs() []prereq {
 		missing = append(missing, prereq{
 			ID:    "claude",
 			Label: "Claude Code CLI",
-			Why:   "The CLI Flow drives. The official installer drops a native binary into ~/.local/bin and works without Node.",
+			Why:   "The CLI Director drives. The official installer drops a native binary into ~/.local/bin and works without Node.",
 			Fix:   "curl -fsSL https://claude.ai/install.sh | bash",
 			Note:  "After install, run `claude` once and complete the login flow before clicking Recheck.",
 			DocsURL: "https://docs.claude.com/en/docs/claude-code/installation",
@@ -362,7 +368,7 @@ func checkPrereqs() []prereq {
 		missing = append(missing, prereq{
 			ID:    "claude-login",
 			Label: "Claude Code login",
-			Why:   "Flow uses your Claude Code session. Run the CLI once and finish the login.",
+			Why:   "Director uses your Claude Code session. Run the CLI once and finish the login.",
 			Fix:   "claude",
 			Note:  "Quit it (Ctrl-C) once you see the prompt come back, then click Recheck.",
 		})
@@ -495,11 +501,11 @@ func ensureDispatcher() {
 		"--kind", "dispatcher",
 		"--display-name", "Director",
 		"--description", "routes user requests")
-	// Anchor at ~/Flow so the dispatcher's recorded cwd isn't '/'
+	// Anchor at the data dir so the dispatcher's recorded cwd isn't '/'
 	// (Finder/Dock launches inherit '/'). Every agent the dispatcher
 	// later spawns inherits this in turn via the parent's cwd at
 	// roster-spawn time.
-	dir := flowDataDir()
+	dir := directorDataDir()
 	if err := os.MkdirAll(dir, 0o755); err == nil {
 		cmd.Dir = dir
 	}
@@ -520,7 +526,7 @@ const setupHTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Flow — Setup</title>
+<title>Director — Setup</title>
 <style>
 :root{
   --linen:#F5EFE6;
@@ -566,7 +572,7 @@ a:hover{text-decoration:underline}
 <div class="__wails_drag_region"></div>
 <div class="wrap">
   <h1>Almost there.</h1>
-  <p class="sub">Flow drives Claude Code on your machine and needs a few tools installed
+  <p class="sub">Director drives Claude Code on your machine and needs a few tools installed
   before it can spawn agents. We'll point you at each one — click <em>Install</em> to open
   Terminal with the command pre-loaded.</p>
   <div id="list" class="list"></div>
@@ -583,7 +589,7 @@ function render(items){
   const list = document.getElementById('list');
   list.innerHTML = '';
   if (items.length === 0) {
-    list.innerHTML = '<div class="allgood">All set. Loading Flow…</div>';
+    list.innerHTML = '<div class="allgood">All set. Loading Director…</div>';
     setTimeout(() => location.reload(), 800);
     return;
   }
