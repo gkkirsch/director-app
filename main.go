@@ -24,7 +24,7 @@ import (
 )
 
 // Wails wants an embedded asset FS even though we never use it — the
-// webview content comes from our reverse-proxied fleetview server. A
+// webview content comes from our reverse-proxied director-server. A
 // placeholder file keeps the embed pattern valid.
 //
 
@@ -59,12 +59,12 @@ func main() {
 	app := &appState{proxy: proxy}
 	defer app.shutdown()
 
-	// If prereqs already pass at launch, spawn fleetview eagerly and
+	// If prereqs already pass at launch, spawn director-server eagerly and
 	// kick off dispatcher init in a goroutine. The dispatch handler
 	// gates `/` on init status until the dispatcher exists, so users
 	// see the setup page (with init progress) instead of an empty UI.
 	if len(checkPrereqs()) == 0 {
-		if err := app.startFleetview(); err != nil {
+		if err := app.startDirectorServer(); err != nil {
 			fmt.Fprintln(os.Stderr, "fleet-app:", err)
 			os.Exit(1)
 		}
@@ -85,7 +85,7 @@ func main() {
 		MinHeight: 520,
 		AssetServer: &assetserver.Options{
 			// Handler is the source of truth — everything proxies to
-			// fleetview, including /. Skip Assets entirely so Wails
+			// director-server, including /. Skip Assets entirely so Wails
 			// doesn't intercept "/" → embedded index.html.
 			Handler: mux,
 		},
@@ -112,9 +112,9 @@ func main() {
 	}
 }
 
-// appState wires together the lazily-spawned fleetview backend, the
+// appState wires together the lazily-spawned director-server backend, the
 // reverse proxy in front of it, and a per-request dispatcher that
-// picks between "show setup page" and "proxy to fleetview" based on
+// picks between "show setup page" and "proxy to director-server" based on
 // whether prereqs are satisfied yet.
 //
 // initStatus tracks the dispatcher-spawn state machine. Friends
@@ -153,8 +153,8 @@ func (a *appState) getInit() (status, errMsg string) {
 }
 
 // dispatch routes incoming requests. Setup page when prereqs aren't
-// met OR fleetview isn't up OR the dispatcher hasn't been spawned yet;
-// otherwise reverse-proxy to fleetview.
+// met OR director-server isn't up OR the dispatcher hasn't been spawned yet;
+// otherwise reverse-proxy to director-server.
 //
 // We gate on dispatcher existence (initStatus != ok) because without
 // a dispatcher the UI loads against an empty fleet and looks broken.
@@ -172,10 +172,10 @@ func (a *appState) dispatch(w http.ResponseWriter, r *http.Request) {
 	a.proxy.ServeHTTP(w, r)
 }
 
-// startFleetview locates the bundled binary, spawns it, and waits up
+// startDirectorServer locates the bundled binary, spawns it, and waits up
 // to 5s for it to bind backendAddr. Idempotent — calling twice is a
-// no-op once fleetview is up.
-func (a *appState) startFleetview() error {
+// no-op once director-server is up.
+func (a *appState) startDirectorServer() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.ready {
@@ -185,15 +185,15 @@ func (a *appState) startFleetview() error {
 		a.ready = true
 		return nil
 	}
-	bin, err := findFleetview()
+	bin, err := findDirectorServer()
 	if err != nil {
-		return fmt.Errorf("fleetview not found and nothing is listening on %s", backendAddr)
+		return fmt.Errorf("director-server not found and nothing is listening on %s", backendAddr)
 	}
 	cmd := exec.CommandContext(context.Background(), bin)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	// Force a sensible cwd. When the .app is launched by Finder/Dock,
-	// fleetview otherwise inherits "/" — and every subsequent
+	// director-server otherwise inherits "/" — and every subsequent
 	// `roster spawn` (called by the dispatcher / orchestrators) inherits
 	// that too, which means agents try to mkdir under "/" and hit
 	// "Read-only file system." Anchor everything at the data dir so
@@ -203,7 +203,7 @@ func (a *appState) startFleetview() error {
 		fmt.Fprintf(os.Stderr, "fleet-app: mkdir %s: %v\n", cmd.Dir, err)
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start fleetview: %w", err)
+		return fmt.Errorf("start director-server: %w", err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -215,7 +215,7 @@ func (a *appState) startFleetview() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	_ = cmd.Process.Kill()
-	return fmt.Errorf("fleetview did not bind %s within 5s", backendAddr)
+	return fmt.Errorf("director-server did not bind %s within 5s", backendAddr)
 }
 
 func (a *appState) shutdown() {
@@ -240,24 +240,24 @@ func directorDataDir() string {
 	return filepath.Join(home, "Library", "Application Support", "Director")
 }
 
-// findFleetview prefers the sibling binary inside the .app bundle
+// findDirectorServer prefers the sibling binary inside the .app bundle
 // (build.sh drops it there), then falls back to PATH for dev workflow.
-func findFleetview() (string, error) {
+func findDirectorServer() (string, error) {
 	if exe, err := os.Executable(); err == nil {
 		if real, err := filepath.EvalSymlinks(exe); err == nil {
-			sibling := filepath.Join(filepath.Dir(real), "fleetview")
+			sibling := filepath.Join(filepath.Dir(real), "director-server")
 			if fi, err := os.Stat(sibling); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
 				return sibling, nil
 			}
 		}
 	}
-	return exec.LookPath("fleetview")
+	return exec.LookPath("director-server")
 }
 
 // dragSnippet is a tiny HTML overlay we splice into every HTML response
 // from fleetview. Wails interprets `--wails-draggable: drag` as a window
 // drag handle, so this 28px strip across the top makes the window draggable
-// without us having to ship custom CSS in fleetview itself. Buttons start
+// without us having to ship custom CSS in director-server itself. Buttons start
 // at pt-8/pt-10 so nothing clickable lives in this band.
 //
 // Plus a global click handler that catches target="_blank" links and
@@ -489,7 +489,7 @@ func (a *appState) recheckHandler(w http.ResponseWriter, r *http.Request) {
 	}{Missing: missing, InitStatus: initStatus, InitError: initErr}
 
 	if len(missing) == 0 {
-		if err := a.startFleetview(); err != nil {
+		if err := a.startDirectorServer(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -551,8 +551,8 @@ func (a *appState) initDirector() {
 	a.setInit(initRunning, "")
 	logSetup("init: starting")
 
-	// Wait up to 5s for fleetview to bind its port before probing
-	// /api/fleet. startFleetview already polls but a slow box could
+	// Wait up to 5s for director-server to bind its port before probing
+	// /api/fleet. startDirectorServer already polls but a slow box could
 	// race the goroutine that called us.
 	for i := 0; i < 50 && !portAlive(backendAddr); i++ {
 		time.Sleep(100 * time.Millisecond)

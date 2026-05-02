@@ -1,65 +1,69 @@
 #!/usr/bin/env bash
-# Build the Director.app bundle with fleetview + satellites baked in.
+# Build the Director.app bundle with director-server + satellites baked in.
 #
-# We pull every binary fleet runs (roster, camux, amux, fleetview) into
-# Contents/MacOS/. main.go prepends that dir to PATH before spawning
-# fleetview so a user who installed via the .app never needs ~/.local/bin.
+# We pull every binary Director needs (roster, camux, amux, director-server)
+# into Contents/MacOS/. main.go prepends that dir to PATH before spawning
+# director-server so a user who installed via the .app never needs ~/.local/bin.
 #
 # Usage:
-#   ./build.sh                                 # rebuild fleetview from
-#                                              # ../fleetview (and its
-#                                              # web/ assets), then build
-#                                              # the .app bundle
-#   ./build.sh --no-rebuild                    # use whatever fleetview
-#                                              # is currently on PATH
-#                                              # (faster; trust caller)
-#   FLEETVIEW=/abs/path … ./build.sh           # override the binary
-#                                              # location entirely
+#   ./build.sh                                       # rebuild director-server
+#                                                    # from ../fleetview (the
+#                                                    # local source dir, repo
+#                                                    # gkkirsch/director), then
+#                                                    # build the .app bundle
+#   ./build.sh --no-rebuild                          # use whatever
+#                                                    # director-server is
+#                                                    # currently on PATH
+#   DIRECTOR_SERVER=/abs/path … ./build.sh           # override the binary
+#                                                    # location entirely
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-REBUILD_FLEETVIEW=1
+REBUILD_DIRECTOR_SERVER=1
 INSTALL_TO_APPLICATIONS=0
 for arg in "$@"; do
   case "$arg" in
-    --no-rebuild) REBUILD_FLEETVIEW=0 ;;
+    --no-rebuild) REBUILD_DIRECTOR_SERVER=0 ;;
     --install)    INSTALL_TO_APPLICATIONS=1 ;;
     *) echo "✗ unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
 
-# Find the fleetview source tree. Prefer ../fleetview (the canonical
-# monorepo layout); fall back to $FLEETVIEW_SRC for unusual setups.
-fleetview_src() {
-  if [[ -n "${FLEETVIEW_SRC:-}" ]]; then
-    [[ -d "$FLEETVIEW_SRC" ]] || { echo "✗ FLEETVIEW_SRC=$FLEETVIEW_SRC not a directory" >&2; exit 1; }
-    printf '%s\n' "$FLEETVIEW_SRC"; return
+# Find the director-server source tree. Prefer ../director (the
+# canonical monorepo layout); fall back to $DIRECTOR_SERVER_SRC for
+# unusual setups.
+director_server_src() {
+  if [[ -n "${DIRECTOR_SERVER_SRC:-}" ]]; then
+    [[ -d "$DIRECTOR_SERVER_SRC" ]] || { echo "✗ DIRECTOR_SERVER_SRC=$DIRECTOR_SERVER_SRC not a directory" >&2; exit 1; }
+    printf '%s\n' "$DIRECTOR_SERVER_SRC"; return
   fi
-  if [[ -d "../fleetview" ]]; then
-    (cd ../fleetview && pwd); return
+  if [[ -d "../director" ]]; then
+    (cd ../director && pwd); return
   fi
   return 1
 }
 
-# Rebuild fleetview's frontend + binary from source. This is the
+# Rebuild director-server's frontend + binary from source. This is the
 # "footgun-proof" path — caller never has to remember which order to
 # rebuild things in. If ../fleetview isn't there, we fall through to
 # the legacy "use whatever's on PATH" path with a warning.
-if [[ "$REBUILD_FLEETVIEW" == "1" ]]; then
-  if SRC="$(fleetview_src)"; then
-    echo "→ rebuilding fleetview from $SRC"
+if [[ "$REBUILD_DIRECTOR_SERVER" == "1" ]]; then
+  if SRC="$(director_server_src)"; then
+    echo "→ rebuilding director-server from $SRC"
     (cd "$SRC/web" && npm run build) >/dev/null
-    (cd "$SRC" && go build -o "$HOME/.local/bin/fleetview" .)
-    echo "    ✓ ~/.local/bin/fleetview"
+    (cd "$SRC" && go build -o "$HOME/.local/bin/director-server" .)
+    echo "    ✓ ~/.local/bin/director-server"
   else
-    echo "⚠ ../fleetview not found and FLEETVIEW_SRC not set — using whatever fleetview is on PATH" >&2
+    echo "⚠ ../fleetview not found and DIRECTOR_SERVER_SRC not set — using whatever director-server is on PATH" >&2
   fi
 fi
 
 resolve() {
   local name="$1" upper
-  upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+  # Hyphens aren't valid in shell var names. Translate them to
+  # underscores so `director-server` → DIRECTOR_SERVER.
+  upper="$(printf '%s' "$name" | tr '[:lower:]-' '[:upper:]_')"
   local override="${!upper:-}"
   if [[ -n "$override" ]]; then
     [[ -x "$override" ]] || { echo "✗ $upper=$override not executable" >&2; exit 1; }
@@ -75,13 +79,18 @@ resolve() {
   exit 1
 }
 
-FLEETVIEW="$(resolve fleetview)"
+DIRECTOR_SERVER="$(resolve director-server)"
 ROSTER="$(resolve roster)"
 CAMUX="$(resolve camux)"
 AMUX="$(resolve amux)"
 
+# Wails is incremental — without this, stale siblings from previous
+# builds (e.g. an old `fleetview` before the binary rename) hang
+# around in Contents/MacOS forever. Always start clean.
+rm -rf build/bin
+
 echo "→ bundling:"
-for bin in "$FLEETVIEW" "$ROSTER" "$CAMUX" "$AMUX"; do
+for bin in "$DIRECTOR_SERVER" "$ROSTER" "$CAMUX" "$AMUX"; do
   echo "    $(basename "$bin")  ($bin)"
 done
 
@@ -90,7 +99,7 @@ done
 APP="build/bin/Director.app"
 MACOS="$APP/Contents/MacOS"
 
-for bin in "$FLEETVIEW" "$ROSTER" "$CAMUX" "$AMUX"; do
+for bin in "$DIRECTOR_SERVER" "$ROSTER" "$CAMUX" "$AMUX"; do
   install -m 0755 "$bin" "$MACOS/$(basename "$bin")"
 done
 

@@ -39,8 +39,8 @@ Each tier has a different scope and a different default config.
 
 | Repo | Lang | Role |
 |------|------|------|
-| `gkkirsch/fleet-app` | Go (Wails) | macOS .app wrapper. Spawns `fleetview` as a sidecar; reverse-proxies its HTTP + injects the drag region. |
-| `gkkirsch/fleet` | Go + React | `fleetview` backend (HTTP at :8080) + React SPA. The dashboard. |
+| `gkkirsch/director-app` | Go (Wails) | macOS .app wrapper. Spawns `director-server` as a sidecar; reverse-proxies its HTTP + injects the drag region. |
+| `gkkirsch/director` | Go + React | `director-server` backend (HTTP at :8080) + React SPA. The dashboard. |
 | `gkkirsch/roster` | Go | Agent registry. `spawn` / `resume` / `notify` / `forget` / `list`. Owns CLAUDE_CONFIG_DIR isolation, tmux session env, prompt templates. |
 | `gkkirsch/camux` | Go | Claude Code TUI primitives. State detection (regex on tmux pane) + `interrupt` + `spawn` + `ask`. |
 | `gkkirsch/amux` | Go | Thin tmux wrapper. `new` / `kill` / `paste` / `capture`. |

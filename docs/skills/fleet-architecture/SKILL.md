@@ -39,12 +39,12 @@ They mirror each other.
 | `gkkirsch/roster` | `roster_*.tar.gz` | `roster` |
 | `gkkirsch/camux`  | `camux_*.tar.gz`  | `camux`  |
 | `gkkirsch/amux`   | `amux_*.tar.gz`   | `amux`   |
-| `gkkirsch/fleet`  | `fleet_*.tar.gz`  | `fleetview` |
+| `gkkirsch/director`  | `fleet_*.tar.gz`  | `director-server` |
 
-The `fleet` ↔ `fleetview` mismatch is the most common trip-up. Don't
+The `fleet` ↔ `director-server` mismatch is the most common trip-up. Don't
 write loops that assume `repo == binary`.
 
-`gkkirsch/fleet-app` is the umbrella. Its release pipeline downloads the
+`gkkirsch/director-app` is the umbrella. Its release pipeline downloads the
 latest of the four satellites and bundles them into `Flow.app/Contents/MacOS/`.
 
 ## Communication protocol
@@ -136,13 +136,13 @@ release builds re-embed automatically.
 
 | Task | Repo |
 |---|---|
-| Sidebar/topnav/chat UX | `gkkirsch/fleet` (`web/src/App.tsx`) |
-| Plugin detail / setup metadata | `gkkirsch/fleet` (`plugin_setup.go`, `App.tsx`) |
+| Sidebar/topnav/chat UX | `gkkirsch/director` (`web/src/App.tsx`) |
+| Plugin detail / setup metadata | `gkkirsch/director` (`plugin_setup.go`, `App.tsx`) |
 | Agent lifecycle / spawn / claude config | `gkkirsch/roster` |
 | Inter-agent message format | `gkkirsch/roster` (`commands.go::cmdNotify`) + UI parser |
 | State detection / camux interrupt | `gkkirsch/camux` (`claude.go`) |
 | tmux primitives | `gkkirsch/amux` |
-| Wails wrapper / drag region / setup screen | `gkkirsch/fleet-app` |
+| Wails wrapper / drag region / setup screen | `gkkirsch/director-app` |
 | Default plugins (advanced-memory etc) | `gkkirsch/gkkirsch-claude-plugins/plugins/<name>/` |
 
 ## Before you commit

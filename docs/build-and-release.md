@@ -61,7 +61,7 @@ Tag `v*` triggers `.github/workflows/release.yml` on macos-14:
 
 ```
 roster, camux, amux  →  goreleaser  →  <repo>_darwin_arm64.tar.gz  containing the bare binary
-fleet (fleetview)    →  goreleaser  →  fleet_darwin_arm64.tar.gz   containing the `fleetview` binary
+fleet (fleetview)    →  goreleaser  →  fleet_darwin_arm64.tar.gz   containing the `director-server` binary
                                        ^^^^^                       ^^^^^^^^^
                                        repo name ≠                 binary name
 ```
@@ -73,7 +73,7 @@ This **asymmetry** is the #1 trip-up:
 | `gkkirsch/roster` | `roster_*` | `roster` |
 | `gkkirsch/camux`  | `camux_*`  | `camux`  |
 | `gkkirsch/amux`   | `amux_*`   | `amux`   |
-| `gkkirsch/fleet`  | `fleet_*`  | `fleetview` |
+| `gkkirsch/director`  | `fleet_*`  | `director-server` |
 
 `fleet-app`'s release workflow handles this with an explicit `repo:binary`
 mapping in its YAML. Don't write `for repo in roster camux amux fleetview`
@@ -85,7 +85,7 @@ Tag fleet-app → workflow:
 1. `actions/setup-go`, `actions/setup-node`
 2. Install Wails CLI: `go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0`
 3. Pull the latest release of each satellite (mapping above) into `satellites/`
-4. Run `./build.sh` with `FLEETVIEW=satellites/fleetview ROSTER=...` env vars
+4. Run `./build.sh` with `FLEETVIEW=satellites/director-server ROSTER=...` env vars
 5. `ditto -ck Flow.app Flow.app.zip` (preserves bundle metadata + symlinks
    — `zip` strips them)
 6. `softprops/action-gh-release@v2` attaches `Flow.app.zip` + `.sha256`

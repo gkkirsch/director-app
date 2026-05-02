@@ -53,19 +53,19 @@ jobs:
           roster:roster
           camux:camux
           amux:amux
-          fleet:fleetview
+          director:director-server
           EOF
           ls -la satellites
 
       - name: Build Director.app
         env:
-          FLEETVIEW: ${{ github.workspace }}/satellites/fleetview
-          ROSTER:    ${{ github.workspace }}/satellites/roster
-          CAMUX:     ${{ github.workspace }}/satellites/camux
-          AMUX:      ${{ github.workspace }}/satellites/amux
+          DIRECTOR_SERVER: ${{ github.workspace }}/satellites/director-server
+          ROSTER:          ${{ github.workspace }}/satellites/roster
+          CAMUX:           ${{ github.workspace }}/satellites/camux
+          AMUX:            ${{ github.workspace }}/satellites/amux
         run: |
-          # CI uses pre-built fleetview from the satellites step; pass
-          # --no-rebuild so build.sh skips the local-source rebuild path.
+          # CI uses pre-built director-server from the satellites step;
+          # pass --no-rebuild so build.sh skips the local-source rebuild.
           ./build.sh --no-rebuild
 
       - name: Package Director.app.zip
