@@ -10,11 +10,11 @@ dispatcher ── routes ──→ orchestrator ── delegates ──→ worke
 Each tier has a different scope and a different default config.
 
 ### Dispatcher (one)
-- The user-facing surface. Display name `director`; on-disk id `dispatch`.
+- The user-facing surface. On-disk id `director`.
 - **Pure router.** Reads `roster list`, picks the best orchestrator by description,
   delegates via `roster notify`. Does not do domain work itself.
 - Pinned to `claude-sonnet-4-6` via `--model` on spawn.
-- Own `CLAUDE_CONFIG_DIR` at `<roster_data>/claude/dispatch`. **No plugins, no skills**
+- Own `CLAUDE_CONFIG_DIR` at `<roster_data>/claude/director`. **No plugins, no skills**
   — the user's global `~/.claude` plugin inventory does NOT bleed in.
 - Skills tab is hidden in the UI for this kind.
 - Emits a `<suggestions>` block at the end of every reply (see communication.md).
@@ -77,7 +77,7 @@ collects the latest release of each satellite into `Flow.app/Contents/MacOS/`.
 Flow (Wails app)                                ← user-launched
 └── fleetview (HTTP server on :8080)            ← spawned by Flow as sidecar
     └── tmux server                             ← already running on user's machine
-        ├── session "dispatch"
+        ├── session "director"
         │   └── window "cc" → claude            ← the dispatcher
         ├── session "orch-foo"
         │   └── window "cc" → claude            ← an orchestrator

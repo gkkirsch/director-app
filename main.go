@@ -119,7 +119,7 @@ func main() {
 //
 // initStatus tracks the dispatcher-spawn state machine. Friends
 // downloading the .app for the first time were landing on an empty
-// fleet because `roster spawn dispatch` could fail silently — now
+// fleet because `roster spawn director` could fail silently — now
 // the spawn captures stderr, writes a setup.log, and the setup page
 // stays visible (with retry) until the dispatcher actually exists.
 type appState struct {
@@ -231,13 +231,9 @@ func (a *appState) shutdown() {
 // things. Defaults to ~/Library/Application Support/Director (proper
 // macOS convention — not visible in Finder's home view, survives the
 // app being moved). Honors $DIRECTOR_HOME for users who want to move
-// it. Also accepts $FLOW_HOME for backwards compat with installs that
-// set it before the rename.
+// it.
 func directorDataDir() string {
 	if d := os.Getenv("DIRECTOR_HOME"); d != "" {
-		return d
-	}
-	if d := os.Getenv("FLOW_HOME"); d != "" {
 		return d
 	}
 	home, _ := os.UserHomeDir()
@@ -544,7 +540,7 @@ end tell`, esc)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// initDirector ensures the "dispatch" dispatcher exists. Updates
+// initDirector ensures the "director" dispatcher exists. Updates
 // a.initStatus (running → ok|failed) so the setup page can show
 // progress and surface real errors. Captures stderr from `roster
 // spawn` and appends to setup.log for post-mortem.
@@ -574,7 +570,7 @@ func (a *appState) initDirector() {
 		return
 	}
 
-	cmd := exec.Command("roster", "spawn", "dispatch",
+	cmd := exec.Command("roster", "spawn", "director",
 		"--kind", "dispatcher",
 		"--display-name", "Director",
 		"--description", "routes user requests")
@@ -641,31 +637,40 @@ func logSetup(line string) {
 // so `--reset` can replay the setup flow without touching the user's
 // actual orchs / artifacts. Targets:
 //
-//   - <data>/dispatch (roster's per-orch claude config dir for
+//   - <data>/director (roster's per-orch claude config dir for
 //     the dispatcher specifically — preserves other agents)
-//   - <roster-data>/agents/dispatch.json (registry entry)
+//   - <roster-data>/agents/director.json (registry entry)
 //   - directorDataDir() / setup.log (so the new run starts a fresh log)
-//   - ~/.agent-browser/dispatch.* daemon files
+//   - ~/.agent-browser/director.* daemon files
+//
+// Also cleans up the legacy "dispatch" id from before the rename so
+// users on v0.5.2 or earlier don't end up with two dispatchers in
+// their registry after upgrading.
 //
 // We deliberately do NOT remove other orchs (hacker-news, etc.) or
 // global plugin caches — those are user data, not setup state.
 func resetDirectorState() error {
 	rosterData := filepath.Join(os.Getenv("HOME"), ".local", "share", "roster")
-	candidates := []string{
-		filepath.Join(rosterData, "claude", "dispatch"),
-		filepath.Join(rosterData, "agents", "dispatch.json"),
-		filepath.Join(directorDataDir(), "setup.log"),
-		filepath.Join(os.Getenv("HOME"), ".agent-browser", "dispatch.pid"),
-		filepath.Join(os.Getenv("HOME"), ".agent-browser", "dispatch.sock"),
-		filepath.Join(os.Getenv("HOME"), ".agent-browser", "dispatch.stream"),
-		filepath.Join(os.Getenv("HOME"), ".agent-browser", "dispatch.version"),
+	var candidates []string
+	for _, id := range []string{"director", "dispatch"} {
+		candidates = append(candidates,
+			filepath.Join(rosterData, "claude", id),
+			filepath.Join(rosterData, "agents", id+".json"),
+			filepath.Join(os.Getenv("HOME"), ".agent-browser", id+".pid"),
+			filepath.Join(os.Getenv("HOME"), ".agent-browser", id+".sock"),
+			filepath.Join(os.Getenv("HOME"), ".agent-browser", id+".stream"),
+			filepath.Join(os.Getenv("HOME"), ".agent-browser", id+".version"),
+		)
 	}
+	candidates = append(candidates, filepath.Join(directorDataDir(), "setup.log"))
 	for _, p := range candidates {
 		_ = os.RemoveAll(p)
 	}
-	// Also kill the dispatch tmux session if it exists, otherwise
-	// `roster spawn dispatch` complains the target is already taken.
-	_ = exec.Command("amux", "kill", "dispatch").Run()
+	// Kill any tmux sessions named after the dispatcher, otherwise
+	// `roster spawn director` would complain the target is taken.
+	for _, id := range []string{"director", "dispatch"} {
+		_ = exec.Command("amux", "kill", id).Run()
+	}
 	return nil
 }
 
