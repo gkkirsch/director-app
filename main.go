@@ -36,6 +36,22 @@ const (
 func main() {
 	bootstrapPATH()
 
+	// `--reset` wipes Director state so first-run can be replayed end
+	// to end. Useful for testing the setup flow without fully nuking
+	// ~/.local/share/roster (which would also drop other agents we
+	// care about between sessions). Wipe is intentionally narrow:
+	// dispatcher claude dir, Director data home, agent-browser
+	// daemons. Existing orchs the user has spawned via the app are
+	// preserved so resetting doesn't discard real work.
+	if len(os.Args) > 1 && os.Args[1] == "--reset" {
+		if err := resetDirectorState(); err != nil {
+			fmt.Fprintln(os.Stderr, "fleet-app: reset:", err)
+			os.Exit(1)
+		}
+		fmt.Println("✓ Director state reset. Launch the app to replay first-run setup.")
+		os.Exit(0)
+	}
+
 	backend, _ := url.Parse(backendURL)
 	proxy := httputil.NewSingleHostReverseProxy(backend)
 	proxy.ModifyResponse = injectDragRegion
@@ -43,14 +59,16 @@ func main() {
 	app := &appState{proxy: proxy}
 	defer app.shutdown()
 
-	// If prereqs already pass at launch, spawn fleetview eagerly.
-	// Otherwise the setup page handles the wait → recheck → spawn flow.
+	// If prereqs already pass at launch, spawn fleetview eagerly and
+	// kick off dispatcher init in a goroutine. The dispatch handler
+	// gates `/` on init status until the dispatcher exists, so users
+	// see the setup page (with init progress) instead of an empty UI.
 	if len(checkPrereqs()) == 0 {
 		if err := app.startFleetview(); err != nil {
 			fmt.Fprintln(os.Stderr, "fleet-app:", err)
 			os.Exit(1)
 		}
-		go ensureDispatcher()
+		go app.initDirector()
 	}
 
 	mux := http.NewServeMux()
@@ -98,21 +116,57 @@ func main() {
 // reverse proxy in front of it, and a per-request dispatcher that
 // picks between "show setup page" and "proxy to fleetview" based on
 // whether prereqs are satisfied yet.
+//
+// initStatus tracks the dispatcher-spawn state machine. Friends
+// downloading the .app for the first time were landing on an empty
+// fleet because `roster spawn dispatch` could fail silently — now
+// the spawn captures stderr, writes a setup.log, and the setup page
+// stays visible (with retry) until the dispatcher actually exists.
 type appState struct {
 	mu    sync.Mutex
 	cmd   *exec.Cmd
 	ready bool
 	proxy *httputil.ReverseProxy
+
+	initMu     sync.RWMutex
+	initStatus string // "", "running", "ok", "failed"
+	initError  string
 }
 
-// dispatch routes "/" — the setup page when fleetview hasn't started
-// yet, otherwise the proxy to fleetview.
+const (
+	initRunning = "running"
+	initOK      = "ok"
+	initFailed  = "failed"
+)
+
+func (a *appState) setInit(status, errMsg string) {
+	a.initMu.Lock()
+	a.initStatus = status
+	a.initError = errMsg
+	a.initMu.Unlock()
+}
+
+func (a *appState) getInit() (status, errMsg string) {
+	a.initMu.RLock()
+	defer a.initMu.RUnlock()
+	return a.initStatus, a.initError
+}
+
+// dispatch routes incoming requests. Setup page when prereqs aren't
+// met OR fleetview isn't up OR the dispatcher hasn't been spawned yet;
+// otherwise reverse-proxy to fleetview.
+//
+// We gate on dispatcher existence (initStatus != ok) because without
+// a dispatcher the UI loads against an empty fleet and looks broken.
+// Better to keep the setup page visible with a "Setting up Director…"
+// card that surfaces real errors when the spawn fails.
 func (a *appState) dispatch(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	ready := a.ready
 	a.mu.Unlock()
-	if !ready {
-		setupHandler(w, r)
+	status, _ := a.getInit()
+	if !ready || status != initOK {
+		setupHandler(a, w, r)
 		return
 	}
 	a.proxy.ServeHTTP(w, r)
@@ -429,18 +483,32 @@ func (a *appState) recheckHandler(w http.ResponseWriter, r *http.Request) {
 	// any rc-file edits.
 	bootstrapPATH()
 	missing := checkPrereqs()
+	initStatus, initErr := a.getInit()
+
 	resp := struct {
-		Missing []prereq `json:"missing"`
-		Ready   bool     `json:"ready"`
-	}{Missing: missing}
+		Missing    []prereq `json:"missing"`
+		Ready      bool     `json:"ready"`
+		InitStatus string   `json:"init_status"`
+		InitError  string   `json:"init_error,omitempty"`
+	}{Missing: missing, InitStatus: initStatus, InitError: initErr}
+
 	if len(missing) == 0 {
 		if err := a.startFleetview(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		go ensureDispatcher()
-		resp.Ready = true
+		// Kick off init if we haven't yet, OR retry if the previous
+		// attempt failed. Don't restart a "running" init — that would
+		// race two `roster spawn`s against the same id.
+		if initStatus == "" || initStatus == initFailed {
+			go a.initDirector()
+			resp.InitStatus = initRunning
+		}
 	}
+	// Ready means user can leave the setup page: prereqs satisfied
+	// AND dispatcher exists.
+	resp.Ready = len(missing) == 0 && resp.InitStatus == initOK
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -476,27 +544,36 @@ end tell`, esc)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ensureDispatcher creates the default "dispatch" agent on first run
-// so the user lands on a working surface instead of an empty fleet.
-// roster's spawn command is idempotent on duplicate ids — the error
-// ("already exists") is the expected path on every run after the first.
-func ensureDispatcher() {
-	// Wait for fleetview to be answering before trusting LookPath +
-	// the API to be stable.
-	for i := 0; i < 30; i++ {
-		if portAlive(backendAddr) {
-			break
-		}
+// initDirector ensures the "dispatch" dispatcher exists. Updates
+// a.initStatus (running → ok|failed) so the setup page can show
+// progress and surface real errors. Captures stderr from `roster
+// spawn` and appends to setup.log for post-mortem.
+//
+// Safe to call multiple times: dispatcherExists short-circuits when
+// the agent is already in roster's registry.
+func (a *appState) initDirector() {
+	a.setInit(initRunning, "")
+	logSetup("init: starting")
+
+	// Wait up to 5s for fleetview to bind its port before probing
+	// /api/fleet. startFleetview already polls but a slow box could
+	// race the goroutine that called us.
+	for i := 0; i < 50 && !portAlive(backendAddr); i++ {
 		time.Sleep(100 * time.Millisecond)
 	}
-	resp, err := http.Get(backendURL + "/api/fleet")
-	if err == nil && resp != nil {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if bytes.Contains(body, []byte(`"kind":"dispatcher"`)) {
-			return
-		}
+	if !portAlive(backendAddr) {
+		msg := "fleetview backend never came up on " + backendAddr
+		logSetup("init failed: " + msg)
+		a.setInit(initFailed, msg)
+		return
 	}
+
+	if dispatcherExists() {
+		logSetup("init: dispatcher already exists")
+		a.setInit(initOK, "")
+		return
+	}
+
 	cmd := exec.Command("roster", "spawn", "dispatch",
 		"--kind", "dispatcher",
 		"--display-name", "Director",
@@ -506,18 +583,109 @@ func ensureDispatcher() {
 	// later spawns inherits this in turn via the parent's cwd at
 	// roster-spawn time.
 	dir := directorDataDir()
-	if err := os.MkdirAll(dir, 0o755); err == nil {
-		cmd.Dir = dir
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		msg := fmt.Sprintf("mkdir %s: %v", dir, err)
+		logSetup("init failed: " + msg)
+		a.setInit(initFailed, msg)
+		return
 	}
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	_ = cmd.Run()
+	cmd.Dir = dir
+	var combined bytes.Buffer
+	cmd.Stdout = io.MultiWriter(&combined, os.Stderr)
+	cmd.Stderr = io.MultiWriter(&combined, os.Stderr)
+	if err := cmd.Run(); err != nil {
+		out := strings.TrimSpace(combined.String())
+		msg := out
+		if msg == "" {
+			msg = err.Error()
+		}
+		logSetup("init failed: roster spawn exited: " + msg)
+		a.setInit(initFailed, msg)
+		return
+	}
+	logSetup("init: dispatcher spawned ok")
+	a.setInit(initOK, "")
 }
 
-func setupHandler(w http.ResponseWriter, r *http.Request) {
+// dispatcherExists asks the running fleetview whether any registered
+// agent is a dispatcher. Cheap; we use it both as the idempotency
+// check before spawning and as the heal signal on subsequent launches.
+func dispatcherExists() bool {
+	resp, err := http.Get(backendURL + "/api/fleet")
+	if err != nil || resp == nil {
+		return false
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return bytes.Contains(body, []byte(`"kind":"dispatcher"`))
+}
+
+// logSetup appends a timestamped line to setup.log in the Director
+// data dir. Best-effort: errors are swallowed since this is purely
+// for post-mortem when a friend reports "doesn't work."
+func logSetup(line string) {
+	dir := directorDataDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	path := filepath.Join(dir, "setup.log")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339), line)
+}
+
+// resetDirectorState wipes the per-machine bits that gate first-run
+// so `--reset` can replay the setup flow without touching the user's
+// actual orchs / artifacts. Targets:
+//
+//   - <data>/dispatch (roster's per-orch claude config dir for
+//     the dispatcher specifically — preserves other agents)
+//   - <roster-data>/agents/dispatch.json (registry entry)
+//   - directorDataDir() / setup.log (so the new run starts a fresh log)
+//   - ~/.agent-browser/dispatch.* daemon files
+//
+// We deliberately do NOT remove other orchs (hacker-news, etc.) or
+// global plugin caches — those are user data, not setup state.
+func resetDirectorState() error {
+	rosterData := filepath.Join(os.Getenv("HOME"), ".local", "share", "roster")
+	candidates := []string{
+		filepath.Join(rosterData, "claude", "dispatch"),
+		filepath.Join(rosterData, "agents", "dispatch.json"),
+		filepath.Join(directorDataDir(), "setup.log"),
+		filepath.Join(os.Getenv("HOME"), ".agent-browser", "dispatch.pid"),
+		filepath.Join(os.Getenv("HOME"), ".agent-browser", "dispatch.sock"),
+		filepath.Join(os.Getenv("HOME"), ".agent-browser", "dispatch.stream"),
+		filepath.Join(os.Getenv("HOME"), ".agent-browser", "dispatch.version"),
+	}
+	for _, p := range candidates {
+		_ = os.RemoveAll(p)
+	}
+	// Also kill the dispatch tmux session if it exists, otherwise
+	// `roster spawn dispatch` complains the target is already taken.
+	_ = exec.Command("amux", "kill", "dispatch").Run()
+	return nil
+}
+
+// setupHandler renders the setup page. We seed it with the current
+// state (missing prereqs + init status) so the first paint is never
+// ambiguous — no "loading…" flicker before the JS poll catches up.
+func setupHandler(a *appState, w http.ResponseWriter, r *http.Request) {
 	missing := checkPrereqs()
-	data, _ := json.Marshal(missing)
-	page := strings.ReplaceAll(setupHTML, "%MISSING%", string(data))
+	missingJSON, _ := json.Marshal(missing)
+	status, errMsg := "", ""
+	if a != nil {
+		status, errMsg = a.getInit()
+	}
+	stateJSON, _ := json.Marshal(map[string]any{
+		"missing":     missing,
+		"init_status": status,
+		"init_error":  errMsg,
+	})
+	page := strings.ReplaceAll(setupHTML, "%MISSING%", string(missingJSON))
+	page = strings.ReplaceAll(page, "%STATE%", string(stateJSON))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(page))
 }
@@ -543,29 +711,40 @@ html,body{height:100%;margin:0;background:var(--linen);color:var(--ink);
 .__wails_drag_region{position:fixed;top:0;left:0;right:0;height:28px;z-index:99;
   --wails-draggable:drag;-webkit-app-region:drag;cursor:default;
   user-select:none;-webkit-user-select:none;}
-.wrap{max-width:560px;margin:0 auto;padding:80px 40px 40px}
-h1{font-family:Georgia,"New York",serif;font-weight:400;font-size:38px;line-height:1;margin:0}
-.sub{margin-top:14px;color:var(--muted);font-size:14.5px;line-height:1.5}
-.list{margin-top:32px;display:flex;flex-direction:column;gap:14px}
-.card{background:var(--card);border:1px solid var(--rule);border-radius:14px;padding:20px}
-.row{display:flex;align-items:baseline;justify-content:space-between;gap:16px}
-.label{font-weight:600;font-size:15px}
-.why{margin-top:6px;color:var(--muted);font-size:13px;line-height:1.5}
-.fix{margin-top:14px;display:flex;align-items:center;gap:8px}
+.wrap{max-width:520px;margin:0 auto;padding:56px 36px 28px}
+h1{font-family:Georgia,"New York",serif;font-weight:400;font-size:32px;line-height:1.05;margin:0}
+.sub{margin-top:10px;color:var(--muted);font-size:13.5px;line-height:1.5}
+.list{margin-top:22px;display:flex;flex-direction:column;gap:10px}
+.card{background:var(--card);border:1px solid var(--rule);border-radius:12px;padding:16px}
+.row{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.label{font-weight:600;font-size:14px}
+.why{margin-top:4px;color:var(--muted);font-size:12.5px;line-height:1.5}
+.fix{margin-top:12px;display:flex;align-items:center;gap:8px}
 code{background:var(--linen);border:1px solid var(--rule);border-radius:6px;
-  padding:6px 10px;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;
-  flex:1;min-width:0;overflow:auto;white-space:nowrap}
-button{background:var(--ink);color:var(--linen);border:0;border-radius:8px;
-  padding:8px 14px;font:600 12px/1 -apple-system,sans-serif;letter-spacing:.06em;
+  padding:6px 10px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;
+  flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+button{background:var(--ink);color:var(--linen);border:0;border-radius:7px;
+  padding:7px 12px;font:600 11px/1 -apple-system,sans-serif;letter-spacing:.06em;
   text-transform:uppercase;cursor:pointer;white-space:nowrap}
 button.ghost{background:transparent;color:var(--ink);border:1px solid var(--rule)}
 button:hover{opacity:.92}
-.note{margin-top:10px;color:var(--muted);font-size:12.5px;line-height:1.5}
-.footer{margin-top:28px;display:flex;justify-content:space-between;align-items:center;gap:12px}
-.status{color:var(--muted);font-size:13px}
-.allgood{margin-top:32px;text-align:center;color:var(--accent);font-size:16px}
+.note{margin-top:8px;color:var(--muted);font-size:11.5px;line-height:1.5}
+.footer{margin-top:18px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.status{color:var(--muted);font-size:12.5px}
+.allgood{margin-top:24px;text-align:center;color:var(--accent);font-size:15px}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
+.spinner{width:14px;height:14px;border-radius:50%;border:2px solid var(--rule);
+  border-top-color:var(--accent);animation:spin .8s linear infinite;flex-shrink:0;margin-top:2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.errbox{margin-top:12px;background:var(--linen);border:1px solid var(--rule);
+  border-radius:6px;padding:10px 12px;font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;
+  white-space:pre-wrap;word-break:break-word;max-height:140px;overflow:auto;color:#8a3c2c}
+/* Slim scrollbars — the macOS default tracks looked massive against
+   the linen card. Same treatment for any nested scrollers (errbox). */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-thumb{background:var(--rule);border-radius:3px}
+::-webkit-scrollbar-track{background:transparent}
 </style>
 </head>
 <body>
@@ -582,18 +761,25 @@ a:hover{text-decoration:underline}
   </div>
 </div>
 <script>
-const initial = %MISSING%;
+const initialState = %STATE%;
 let busy = false;
+let polling = false;
 
-function render(items){
+function render(state){
   const list = document.getElementById('list');
   list.innerHTML = '';
-  if (items.length === 0) {
+  const missing = state.missing || [];
+  const initStatus = state.init_status || '';
+  const initError = state.init_error || '';
+
+  if (missing.length === 0 && initStatus === 'ok') {
     list.innerHTML = '<div class="allgood">All set. Loading Director…</div>';
-    setTimeout(() => location.reload(), 800);
+    setTimeout(() => location.reload(), 600);
     return;
   }
-  for (const p of items) {
+
+  // Stage 1: prereq cards.
+  for (const p of missing) {
     const card = document.createElement('div');
     card.className = 'card';
     card.innerHTML = ` + "`" + `
@@ -614,8 +800,7 @@ function render(items){
   }
   for (const b of list.querySelectorAll('button[data-cmd]')) {
     b.addEventListener('click', async () => {
-      if (busy) return;
-      busy = true;
+      if (busy) return; busy = true;
       const cmd = b.getAttribute('data-cmd');
       await fetch('/__setup/run?cmd=' + encodeURIComponent(cmd));
       setStatus('Opened Terminal — finish the install and click Recheck.');
@@ -629,23 +814,82 @@ function render(items){
       const t = b.textContent; b.textContent = 'Copied'; setTimeout(()=>b.textContent=t, 1100);
     });
   }
+
+  // Stage 2: dispatcher init card. Only renders when prereqs are
+  // all satisfied so the user moves through one stage at a time.
+  if (missing.length === 0) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    if (initStatus === 'failed') {
+      card.innerHTML = ` + "`" + `
+        <div class="row"><div>
+          <div class="label">Setup failed</div>
+          <div class="why">Director couldn't spawn its dispatcher. Most often this is a Claude Code login issue or a network blip during plugin install.</div>
+        </div></div>
+        <pre class="errbox">${escapeHTML(initError || 'unknown error')}</pre>
+        <div class="fix"><button id="retry">Retry setup</button></div>
+        <div class="note">Full log at <code>~/Library/Application Support/Director/setup.log</code></div>
+      ` + "`" + `;
+    } else {
+      card.innerHTML = ` + "`" + `
+        <div class="row"><div>
+          <div class="label">Setting up Director…</div>
+          <div class="why">Spawning the dispatcher and installing default plugins. This takes ~30s on first launch.</div>
+        </div><div class="spinner"></div></div>
+      ` + "`" + `;
+    }
+    list.appendChild(card);
+    const retry = document.getElementById('retry');
+    if (retry) retry.addEventListener('click', () => recheck());
+    if (initStatus !== 'failed') startPolling();
+  }
+}
+
+function escapeHTML(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function setStatus(s){ document.getElementById('status').textContent = s; }
 
-document.getElementById('recheck').addEventListener('click', async () => {
+async function recheck(){
   if (busy) return; busy = true;
   setStatus('Checking…');
   try {
     const r = await fetch('/__setup/recheck');
     const d = await r.json();
-    if (d.ready) { render([]); return; }
-    render(d.missing);
-    setStatus('Still missing ' + d.missing.length + ' — finish the install above.');
+    render(d);
+    if (d.missing.length === 0) {
+      setStatus(d.init_status === 'ok' ? '' : '');
+    } else {
+      setStatus('Still missing ' + d.missing.length + ' — finish the install above.');
+    }
   } finally { busy = false; }
-});
+}
 
-render(initial);
+// Auto-poll while the dispatcher is initializing so the user sees
+// the transition without clicking Recheck. Stops as soon as init
+// reaches a terminal state (ok or failed).
+function startPolling(){
+  if (polling) return;
+  polling = true;
+  (async function loop(){
+    while (polling) {
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const r = await fetch('/__setup/recheck');
+        const d = await r.json();
+        render(d);
+        if (d.init_status === 'ok' || d.init_status === 'failed' || d.missing.length > 0) {
+          polling = false;
+          return;
+        }
+      } catch (e) { /* keep polling */ }
+    }
+  })();
+}
+
+document.getElementById('recheck').addEventListener('click', recheck);
+render(initialState);
 </script>
 </body>
 </html>`
