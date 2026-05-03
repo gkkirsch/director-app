@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -529,8 +528,7 @@ return out`, sep)
 		writeTokenSniff(w, "", "")
 		return
 	}
-	tokenRe := regexp.MustCompile(`sk-ant-oat01-[A-Za-z0-9_\-]+`)
-	match := tokenRe.FindString(string(out))
+	match := extractSetupToken(string(out))
 	if match == "" {
 		writeTokenSniff(w, "", "")
 		return
@@ -547,6 +545,103 @@ return out`, sep)
 		return
 	}
 	writeTokenSniff(w, match, "")
+}
+
+// extractSetupToken pulls a complete sk-ant-oat01-… token from a chunk
+// of arbitrary terminal scrollback.
+//
+// `claude setup-token` prints the token on its own line, sandwiched
+// between blank lines:
+//
+//   Your OAuth token (valid for 1 year):
+//
+//   sk-ant-oat01-AAA…AAA
+//
+//   Store this token securely.
+//
+// Terminal hard-wraps long lines at the column width — so if the
+// token is longer than the terminal is wide, a literal `\n` lands
+// mid-token. We have to skip THAT newline (a "soft wrap") but stop
+// at a paragraph break (a blank line, or a line with only whitespace).
+//
+// Strategy: anchor on `sk-ant-oat01-` (only appears in real tokens —
+// the "Use this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=…"
+// line uses a `<token>` placeholder). Walk forward; valid token chars
+// append; whitespace runs are checked — a single `\n` is a soft wrap
+// (skip), but `\n` followed by a blank line (or any non-token-char
+// after whitespace) ends the token. Use LastIndex so re-runs of
+// setup-token always pick the most recent.
+func extractSetupToken(s string) string {
+	const tokenPrefix = "sk-ant-oat01-"
+	const minLen = 50
+	const maxLen = 200
+
+	idx := strings.LastIndex(s, tokenPrefix)
+	if idx < 0 {
+		return ""
+	}
+	tail := s[idx+len(tokenPrefix):]
+
+	var buf strings.Builder
+	buf.WriteString(tokenPrefix)
+
+	isTokenChar := func(r rune) bool {
+		return (r >= 'A' && r <= 'Z') ||
+			(r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9') ||
+			r == '_' || r == '-'
+	}
+
+walk:
+	for i := 0; i < len(tail) && buf.Len() < maxLen; i++ {
+		r := rune(tail[i])
+		if isTokenChar(r) {
+			buf.WriteRune(r)
+			continue
+		}
+		// Whitespace: peek ahead. A soft wrap is a single `\n` (or
+		// `\r\n`) immediately followed by another token char on the
+		// next line. Anything else (blank line, two newlines, line
+		// with only spaces, etc) terminates the token.
+		if r == ' ' || r == '\t' || r == '\r' {
+			continue
+		}
+		if r == '\n' {
+			j := i + 1
+			for j < len(tail) {
+				nx := tail[j]
+				if nx == ' ' || nx == '\t' || nx == '\r' {
+					j++
+					continue
+				}
+				if nx == '\n' {
+					// Blank line → paragraph break → end of token.
+					break walk
+				}
+				if isTokenChar(rune(nx)) {
+					// Soft wrap: jump i forward past the whitespace
+					// run; the outer loop's i++ then lands on the
+					// next token char.
+					i = j - 1
+					continue walk
+				}
+				// Non-token, non-whitespace next char → end.
+				break walk
+			}
+			break walk
+		}
+		// Any other char → end.
+		break walk
+	}
+
+	body := buf.String()
+	if !strings.HasPrefix(body, tokenPrefix) || len(body) <= len(tokenPrefix) {
+		return ""
+	}
+	if len(body) < minLen {
+		return ""
+	}
+	return body
 }
 
 func writeTokenSniff(w http.ResponseWriter, token, errMsg string) {
