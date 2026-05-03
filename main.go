@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -75,6 +76,8 @@ func main() {
 	mux.HandleFunc("/__open", openURLHandler)
 	mux.HandleFunc("/__setup/recheck", app.recheckHandler)
 	mux.HandleFunc("/__setup/run", runInTerminalHandler)
+	mux.HandleFunc("/__setup/auth-token", authTokenHandler)
+	mux.HandleFunc("/__setup/sniff-token", sniffTokenHandler)
 	mux.HandleFunc("/", app.dispatch)
 
 	err := wails.Run(&options.App{
@@ -386,6 +389,13 @@ type prereq struct {
 	Fix     string `json:"fix"`              // shell command to run
 	DocsURL string `json:"docs_url,omitempty"`
 	Note    string `json:"note,omitempty"`
+
+	// Optional: render an inline text input + submit button. Used by
+	// the Director auth step where the user pastes a setup-token after
+	// running `claude setup-token` in Terminal.
+	AcceptsInput     bool   `json:"accepts_input,omitempty"`
+	InputPlaceholder string `json:"input_placeholder,omitempty"`
+	InputSubmitURL   string `json:"input_submit_url,omitempty"`
 }
 
 func checkPrereqs() []prereq {
@@ -414,13 +424,16 @@ func checkPrereqs() []prereq {
 			Note:  "After install, run `claude` once and complete the login flow before clicking Recheck.",
 			DocsURL: "https://docs.claude.com/en/docs/claude-code/installation",
 		})
-	} else if !claudeAuthenticated() {
+	} else if !directorAuthConfigured() {
 		missing = append(missing, prereq{
-			ID:    "claude-login",
-			Label: "Claude Code login",
-			Why:   "Director uses your Claude Code session. Run the CLI once and finish the login.",
-			Fix:   "claude",
-			Note:  "Quit it (Ctrl-C) once you see the prompt come back, then click Recheck.",
+			ID:    "director-auth-token",
+			Label: "Director auth token",
+			Why:   "Director runs many orchs in parallel. To avoid token-rotation conflicts, every orch shares one long-lived setup-token instead of using your interactive Claude session.",
+			Fix:   "claude setup-token",
+			Note:  "After the browser flow finishes, copy the token from your terminal and paste it below.",
+			AcceptsInput:    true,
+			InputPlaceholder: "sk-ant-oat01-…",
+			InputSubmitURL:   "/__setup/auth-token",
 		})
 	}
 	return missing
@@ -462,13 +475,126 @@ func findClaude() string {
 	return ""
 }
 
-// claudeAuthenticated returns true if the user has a Claude Code
-// keychain entry. The CLI writes "Claude Code-credentials" after a
-// successful login.
-func claudeAuthenticated() bool {
+// directorAuthConfigured returns true when the user has run
+// `claude setup-token` and pasted the resulting token into Director.
+// The token is the per-machine OAuth credential every spawned orch
+// uses (see roster's directorOAuthToken in claudedir.go).
+func directorAuthConfigured() bool {
 	cmd := exec.Command("/usr/bin/security", "find-generic-password",
-		"-s", "Claude Code-credentials", "-a", os.Getenv("USER"))
+		"-s", "Director-OAuth-Token", "-a", os.Getenv("USER"))
 	return cmd.Run() == nil
+}
+
+// sniffTokenHandler reads the contents of every open Terminal.app
+// tab via AppleScript, looks for an `sk-ant-oat01-…` setup-token
+// pattern, and (if found) stores it the same way the manual paste
+// form does. The setup page polls this endpoint every ~2s after the
+// user clicks "Open Terminal" so they don't actually have to copy
+// anything — Director scrapes the token off-screen the moment it
+// appears.
+//
+// Why scrape vs. capture stdout: claude-code's setup-token command
+// drives an OAuth browser flow, which we can't take over. The simplest
+// robust capture point is the user's own terminal where the command
+// already prints the token they would otherwise paste manually.
+func sniffTokenHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	// Pull contents of every Terminal tab in every window. AppleScript
+	// joins them with a delimiter we won't see in real output so we can
+	// scan the whole blob with one regex.
+	// Use `history of t` (the scrollback string) rather than
+	// `contents of t` — the latter returns a class that AppleScript
+	// can't always coerce to Unicode text and errors out (-1700).
+	const sep = "\u0001---DIR-TAB-SEP---\u0001"
+	script := fmt.Sprintf(`set out to ""
+tell application "Terminal"
+  if (count of windows) is 0 then return ""
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        set out to out & (history of t) & "%s"
+      end try
+    end repeat
+  end repeat
+end tell
+return out`, sep)
+	cmd := exec.Command("osascript", "-e", script)
+	out, err := cmd.Output()
+	if err != nil {
+		// Terminal not running, no Apple-Events permission yet, etc —
+		// just return "no token", the UI will keep polling.
+		writeTokenSniff(w, "", "")
+		return
+	}
+	tokenRe := regexp.MustCompile(`sk-ant-oat01-[A-Za-z0-9_\-]+`)
+	match := tokenRe.FindString(string(out))
+	if match == "" {
+		writeTokenSniff(w, "", "")
+		return
+	}
+	// Persist via roster, same as the manual paste path.
+	rosterPath, err := exec.LookPath("roster")
+	if err != nil {
+		writeTokenSniff(w, "", "roster CLI not on PATH")
+		return
+	}
+	setCmd := exec.Command(rosterPath, "auth", "set", match)
+	if outBytes, err := setCmd.CombinedOutput(); err != nil {
+		writeTokenSniff(w, "", strings.TrimSpace(string(outBytes)))
+		return
+	}
+	writeTokenSniff(w, match, "")
+}
+
+func writeTokenSniff(w http.ResponseWriter, token, errMsg string) {
+	type resp struct {
+		Token string `json:"token,omitempty"`
+		Error string `json:"error,omitempty"`
+		Found bool   `json:"found"`
+	}
+	w.Header().Set("Content-Type", "application/json")
+	r := resp{Token: token, Error: errMsg, Found: token != ""}
+	_ = json.NewEncoder(w).Encode(r)
+}
+
+// authTokenHandler accepts a JSON {token: "sk-ant-oat01-…"} body and
+// stores it via `roster auth set` (which writes the keychain entry).
+// Used by the setup page's inline form on the Director-auth step.
+func authTokenHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	body.Token = strings.TrimSpace(body.Token)
+	if body.Token == "" {
+		http.Error(w, "token required", http.StatusBadRequest)
+		return
+	}
+	rosterPath, err := exec.LookPath("roster")
+	if err != nil {
+		http.Error(w, "roster CLI not on PATH; restart Director after install", http.StatusInternalServerError)
+		return
+	}
+	cmd := exec.Command(rosterPath, "auth", "set", body.Token)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Surface roster's error message back to the UI so the user
+		// sees "doesn't look like a setup-token" / similar.
+		http.Error(w, strings.TrimSpace(string(out)), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"configured":true}`))
 }
 
 func (a *appState) recheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -513,6 +639,14 @@ func (a *appState) recheckHandler(w http.ResponseWriter, r *http.Request) {
 // the supplied command. The command is whitelisted to the install
 // strings we render on the setup page so a hostile fetch can't run
 // arbitrary shell.
+//
+// Race we have to handle: many users have oh-my-zsh's "would you like
+// to update?" prompt fire at shell startup. AppleScript's `do script`
+// types the command in immediately — if the prompt is still pending,
+// the first character of our command gets eaten as the answer to the
+// prompt. So we open Terminal first, give the shell a moment to fully
+// initialize and dismiss any pending prompts (Enter, then sleep),
+// THEN type the command.
 func runInTerminalHandler(w http.ResponseWriter, r *http.Request) {
 	cmd := r.URL.Query().Get("cmd")
 	allowed := false
@@ -529,9 +663,20 @@ func runInTerminalHandler(w http.ResponseWriter, r *http.Request) {
 	// AppleScript escaping: backslash + double quote.
 	esc := strings.ReplaceAll(cmd, `\`, `\\`)
 	esc = strings.ReplaceAll(esc, `"`, `\"`)
+	// Two-stage: first activate Terminal with an empty `do script`
+	// (which opens a new window and runs the user's normal shell init,
+	// including any oh-my-zsh "update?" prompt). Then wait 1.2s for
+	// the shell to settle and any pending prompt to render, send
+	// Return to dismiss it, wait again, and finally type the command.
+	// Result: the user's command lands at a clean prompt regardless of
+	// what oh-my-zsh / starship / their own shell hooks were doing.
 	script := fmt.Sprintf(`tell application "Terminal"
   activate
-  do script "%s"
+  set newTab to do script ""
+  delay 1.2
+  do script "" in newTab
+  delay 0.4
+  do script "%s" in newTab
 end tell`, esc)
 	if err := exec.Command("osascript", "-e", script).Start(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -745,6 +890,11 @@ a:hover{text-decoration:underline}
 .errbox{margin-top:12px;background:var(--linen);border:1px solid var(--rule);
   border-radius:6px;padding:10px 12px;font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;
   white-space:pre-wrap;word-break:break-word;max-height:140px;overflow:auto;color:#8a3c2c}
+input.tokeninput{flex:1;min-width:0;padding:8px 10px;border:1px solid var(--rule);
+  border-radius:6px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:var(--linen);color:var(--ink);outline:none}
+input.tokeninput:focus{border-color:var(--accent)}
+.suberr{margin-top:8px;color:#8a3c2c;font-size:11.5px;line-height:1.4;word-break:break-word}
 /* Slim scrollbars — the macOS default tracks looked massive against
    the linen card. Same treatment for any nested scrollers (errbox). */
 ::-webkit-scrollbar{width:6px;height:6px}
@@ -783,10 +933,20 @@ function render(state){
     return;
   }
 
-  // Stage 1: prereq cards.
+  // Stage 1: prereq cards. Two flavors:
+  //   - shell-fix card: opens Terminal with a command (default).
+  //   - input card: shell-fix PLUS an inline text input that POSTs the
+  //     pasted value to a server endpoint (Director auth-token step).
   for (const p of missing) {
     const card = document.createElement('div');
     card.className = 'card';
+    const inputBlock = p.accepts_input ? ` + "`" + `
+      <div class="fix" style="margin-top:10px">
+        <input type="password" class="tokeninput" placeholder="${(p.input_placeholder || '').replace(/"/g,'&quot;')}" autocomplete="off" spellcheck="false" />
+        <button data-submit="${p.input_submit_url}">Save</button>
+      </div>
+      <div class="suberr" style="display:none"></div>
+    ` + "`" + ` : '';
     card.innerHTML = ` + "`" + `
       <div class="row">
         <div>
@@ -796,9 +956,10 @@ function render(state){
       </div>
       <div class="fix">
         <code>${p.fix}</code>
-        <button data-cmd="${p.fix.replace(/"/g,'&quot;')}">Install</button>
+        <button data-cmd="${p.fix.replace(/"/g,'&quot;')}">Open Terminal</button>
         <button class="ghost" data-copy="${p.fix.replace(/"/g,'&quot;')}">Copy</button>
       </div>
+      ${inputBlock}
       ${p.note ? '<div class="note">'+p.note+'</div>' : ''}
     ` + "`" + `;
     list.appendChild(card);
@@ -808,7 +969,18 @@ function render(state){
       if (busy) return; busy = true;
       const cmd = b.getAttribute('data-cmd');
       await fetch('/__setup/run?cmd=' + encodeURIComponent(cmd));
-      setStatus('Opened Terminal — finish the install and click Recheck.');
+      // If this card supports inline-paste (i.e. setup-token), the
+      // command prints the token right back into the terminal. We
+      // scrape the user's open Terminal tabs every ~2s for an
+      // sk-ant-oat01-… match so they never have to copy + paste.
+      const card = b.closest('.card');
+      const acceptsInput = !!card.querySelector('input.tokeninput');
+      if (acceptsInput) {
+        setStatus('Opened Terminal. Complete the browser flow — Director will pick the token up automatically.');
+        startTokenSniff();
+      } else {
+        setStatus('Opened Terminal — finish the install and click Recheck.');
+      }
       busy = false;
     });
   }
@@ -817,6 +989,34 @@ function render(state){
       const cmd = b.getAttribute('data-copy');
       await navigator.clipboard.writeText(cmd);
       const t = b.textContent; b.textContent = 'Copied'; setTimeout(()=>b.textContent=t, 1100);
+    });
+  }
+  for (const b of list.querySelectorAll('button[data-submit]')) {
+    b.addEventListener('click', async () => {
+      if (busy) return;
+      const card = b.closest('.card');
+      const inp = card.querySelector('input.tokeninput');
+      const err = card.querySelector('.suberr');
+      const url = b.getAttribute('data-submit');
+      const value = (inp.value || '').trim();
+      if (!value) { inp.focus(); return; }
+      busy = true;
+      err.style.display = 'none';
+      err.textContent = '';
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: value }),
+        });
+        if (!r.ok) {
+          err.textContent = (await r.text()).trim() || ('HTTP ' + r.status);
+          err.style.display = 'block';
+        } else {
+          inp.value = '';
+          recheck();
+        }
+      } finally { busy = false; }
     });
   }
 
@@ -886,6 +1086,32 @@ function startPolling(){
         render(d);
         if (d.init_status === 'ok' || d.init_status === 'failed' || d.missing.length > 0) {
           polling = false;
+          return;
+        }
+      } catch (e) { /* keep polling */ }
+    }
+  })();
+}
+
+// Token sniffer — polls the AppleScript-backed Terminal scrape until
+// it finds an sk-ant-oat01-… token. Idempotent (called once per
+// "Open Terminal" click), self-cancelling on success or 60s timeout.
+let sniffing = false;
+function startTokenSniff(){
+  if (sniffing) return;
+  sniffing = true;
+  const startedAt = Date.now();
+  (async function loop(){
+    while (sniffing) {
+      await new Promise(r => setTimeout(r, 1800));
+      if (Date.now() - startedAt > 90_000) { sniffing = false; return; }
+      try {
+        const r = await fetch('/__setup/sniff-token');
+        const d = await r.json();
+        if (d.found) {
+          sniffing = false;
+          setStatus('Token captured — finishing setup…');
+          recheck();
           return;
         }
       } catch (e) { /* keep polling */ }
