@@ -120,11 +120,11 @@ Things that bit us. Each entry: symptom → root cause → fix.
 
 ## Process / OS
 
-### Stale `/tmp/fleetview` squats :8080
+### Stale `/tmp/fleetview` squats :47821
 - **Symptom:** Flow launches, rebuild updates the binary, but the running
   fleetview is still old.
 - **Cause:** an old `director-server` from a debugging session is listening on
-  :8080. Flow's `ensureFleetview` sees the port alive and skips spawning
+  :47821. Flow's `ensureFleetview` sees the port alive and skips spawning
   the new one.
 - **Fix:** `pkill -f "fleetview$"` before relaunching.
 

@@ -40,7 +40,7 @@ Each tier has a different scope and a different default config.
 | Repo | Lang | Role |
 |------|------|------|
 | `gkkirsch/director-app` | Go (Wails) | macOS .app wrapper. Spawns `director-server` as a sidecar; reverse-proxies its HTTP + injects the drag region. |
-| `gkkirsch/director` | Go + React | `director-server` backend (HTTP at :8080) + React SPA. The dashboard. |
+| `gkkirsch/director` | Go + React | `director-server` backend (HTTP at :47821) + React SPA. The dashboard. |
 | `gkkirsch/roster` | Go | Agent registry. `spawn` / `resume` / `notify` / `forget` / `list`. Owns CLAUDE_CONFIG_DIR isolation, tmux session env, prompt templates. |
 | `gkkirsch/camux` | Go | Claude Code TUI primitives. State detection (regex on tmux pane) + `interrupt` + `spawn` + `ask`. |
 | `gkkirsch/amux` | Go | Thin tmux wrapper. `new` / `kill` / `paste` / `capture`. |
@@ -75,7 +75,7 @@ collects the latest release of each satellite into `Flow.app/Contents/MacOS/`.
 
 ```
 Flow (Wails app)                                ← user-launched
-└── fleetview (HTTP server on :8080)            ← spawned by Flow as sidecar
+└── fleetview (HTTP server on :47821)            ← spawned by Flow as sidecar
     └── tmux server                             ← already running on user's machine
         ├── session "director"
         │   └── window "cc" → claude            ← the dispatcher

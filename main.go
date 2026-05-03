@@ -28,10 +28,22 @@ import (
 // placeholder file keeps the embed pattern valid.
 //
 
-const (
-	backendAddr = "127.0.0.1:8080"
+// Director's HTTP backend port. We avoid 8080 because every other dev
+// tool fights for it (Tomcat, Jenkins, Vite proxies, etc) — picked
+// 47821 instead, well clear of registered ports and unlikely to
+// collide. Override via DIRECTOR_PORT for users who need to share the
+// machine with another Director-port consumer.
+var (
+	backendAddr = resolveBackendAddr()
 	backendURL  = "http://" + backendAddr
 )
+
+func resolveBackendAddr() string {
+	if p := os.Getenv("DIRECTOR_PORT"); p != "" {
+		return "127.0.0.1:" + p
+	}
+	return "127.0.0.1:47821"
+}
 
 func main() {
 	bootstrapPATH()
@@ -59,11 +71,18 @@ func main() {
 	app := &appState{proxy: proxy}
 	defer app.shutdown()
 
-	// If prereqs already pass at launch, spawn director-server eagerly and
-	// kick off dispatcher init in a goroutine. The dispatch handler
-	// gates `/` on init status until the dispatcher exists, so users
-	// see the setup page (with init progress) instead of an empty UI.
-	if len(checkPrereqs()) == 0 {
+	// Wails' build pipeline runs this binary briefly to introspect Bind
+	// targets and generate frontend bindings. During that phase we
+	// MUST NOT bind ports, spawn subprocesses, or otherwise act like a
+	// real launch — Wails kills us with SIGKILL after a moment and
+	// any held resources (most importantly :47821) leak into the next
+	// build attempt. Skip the eager startup when WAILS_NO_BIND is set
+	// (we set it ourselves below for build-time invocations) or when
+	// we detect we're being run from a build dir.
+	skipEagerStart := os.Getenv("WAILS_BUILDING") == "1" ||
+		strings.Contains(os.Args[0], "/build/") ||
+		strings.Contains(os.Args[0], "wailsbindings")
+	if !skipEagerStart && len(checkPrereqs()) == 0 {
 		if err := app.startDirectorServer(); err != nil {
 			fmt.Fprintln(os.Stderr, "fleet-app:", err)
 			os.Exit(1)
@@ -154,6 +173,29 @@ func (a *appState) getInit() (status, errMsg string) {
 	return a.initStatus, a.initError
 }
 
+// maybeFastPathInit checks the on-disk roster registry for an existing
+// `director` dispatcher entry and, if found, marks initStatus = ok
+// immediately. Skips the "Setting up Director…" setup page flash that
+// otherwise appears on every relaunch even when the dispatcher has
+// already existed for days. The goroutine running initDirector still
+// runs in the background and will downgrade initStatus to "failed" if
+// the dispatcher's actually broken (e.g. tmux session vanished).
+func (a *appState) maybeFastPathInit() {
+	a.initMu.Lock()
+	defer a.initMu.Unlock()
+	if a.initStatus != "" {
+		return // already either initializing, ok, or failed
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		return
+	}
+	registry := filepath.Join(home, ".local", "share", "roster", "agents", "director.json")
+	if _, err := os.Stat(registry); err == nil {
+		a.initStatus = initOK
+	}
+}
+
 // dispatch routes incoming requests. Setup page when prereqs aren't
 // met OR director-server isn't up OR the dispatcher hasn't been spawned yet;
 // otherwise reverse-proxy to director-server.
@@ -162,7 +204,15 @@ func (a *appState) getInit() (status, errMsg string) {
 // a dispatcher the UI loads against an empty fleet and looks broken.
 // Better to keep the setup page visible with a "Setting up Director…"
 // card that surfaces real errors when the spawn fails.
+//
+// Fast path: on a returning user (dispatcher already exists in the
+// registry on disk), don't make them watch the setup page flash by
+// while initDirector confirms what we already know. We mark the init
+// status OK eagerly the first time dispatch is called; the goroutine
+// running initDirector still validates and corrects the status if
+// something's actually wrong.
 func (a *appState) dispatch(w http.ResponseWriter, r *http.Request) {
+	a.maybeFastPathInit()
 	a.mu.Lock()
 	ready := a.ready
 	a.mu.Unlock()
@@ -788,6 +838,17 @@ end tell`, esc)
 // Safe to call multiple times: dispatcherExists short-circuits when
 // the agent is already in roster's registry.
 func (a *appState) initDirector() {
+	// Fast path for returning users: if the dispatcher's registry
+	// entry already exists on disk, mark init OK immediately and
+	// skip everything else. Avoids the "Setting up Director…" flash
+	// that otherwise appeared on every relaunch even when the
+	// dispatcher had been live for days.
+	if home := os.Getenv("HOME"); home != "" {
+		if _, err := os.Stat(filepath.Join(home, ".local", "share", "roster", "agents", "director.json")); err == nil {
+			a.setInit(initOK, "")
+			return
+		}
+	}
 	a.setInit(initRunning, "")
 	logSetup("init: starting")
 
