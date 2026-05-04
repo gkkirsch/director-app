@@ -47,6 +47,7 @@ func resolveBackendAddr() string {
 
 func main() {
 	bootstrapPATH()
+	installAmuxShim()
 
 	// `--reset` wipes Director state so first-run can be replayed end
 	// to end. Useful for testing the setup flow without fully nuking
@@ -547,6 +548,95 @@ func findClaude() string {
 		return p
 	}
 	return ""
+}
+
+// installAmuxShim writes a thin wrapper to ~/.local/bin/amux that fixes a
+// compatibility issue between camux and amux when called as subprocesses.
+//
+// Background: camux calls amux as separate subprocess invocations. amux's
+// "exists" command checks an in-process session registry — that registry is
+// empty in every new subprocess, so "amux exists <target>" always returns
+// false even right after "amux window <target> -- claude ..." succeeds.
+// camux interprets the false return as "the window disappeared" and aborts.
+//
+// The shim redirects "exists" to query the tmux server state directly (which
+// is the source of truth), and passes every other command to the real amux
+// with AMUX_LOOSE_TARGETS=1 so that subsequent wait-for/capture calls skip
+// the same registry check.
+//
+// ~/.local/bin is prepended to PATH by findClaude() when the Anthropic
+// installer is present, so the shim is naturally found before the bundled
+// amux in Director.app/Contents/MacOS.
+func installAmuxShim() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	// Find the real amux — prefer the bundled copy next to this executable.
+	realAmux := ""
+	if exe, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			candidate := filepath.Join(filepath.Dir(real), "amux")
+			if fi, err := os.Stat(candidate); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+				realAmux = candidate
+			}
+		}
+	}
+	if realAmux == "" {
+		if p, err := exec.LookPath("amux"); err == nil {
+			realAmux = p
+		}
+	}
+	if realAmux == "" {
+		return // nothing to wrap
+	}
+
+	shimDir := filepath.Join(home, ".local", "bin")
+	shimPath := filepath.Join(shimDir, "amux")
+
+	// Skip if an up-to-date shim already points at the same real amux.
+	if existing, err := os.ReadFile(shimPath); err == nil {
+		if strings.Contains(string(existing), realAmux) {
+			return
+		}
+	}
+
+	shim := "#!/usr/bin/env bash\n" +
+		"# amux shim installed by Director.app — do not edit by hand.\n" +
+		"# Fixes: amux exists uses in-process registry that is empty in every\n" +
+		"# new subprocess invocation. Redirect to tmux state directly.\n" +
+		"REAL_AMUX=" + shellQuote(realAmux) + "\n" +
+		`case "$1" in
+  exists)
+    TARGET="$2"
+    if [[ "$TARGET" == *:* ]]; then
+      tmux display-message -t "$TARGET" -p '#{window_name}' &>/dev/null
+    else
+      tmux has-session -t "$TARGET" 2>/dev/null
+    fi
+    exit $?
+    ;;
+  *)
+    AMUX_LOOSE_TARGETS=1 exec "$REAL_AMUX" "$@"
+    ;;
+esac
+`
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		return
+	}
+	if err := os.WriteFile(shimPath, []byte(shim), 0o755); err != nil {
+		return
+	}
+	// Ensure shimDir is in PATH ahead of the bundle so the shim wins.
+	current := os.Getenv("PATH")
+	if !strings.Contains(":"+current+":", ":"+shimDir+":") {
+		os.Setenv("PATH", shimDir+":"+current)
+	}
+}
+
+// shellQuote wraps s in single quotes for safe use in a bash script.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // directorAuthConfigured returns true when the user has run
