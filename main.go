@@ -200,12 +200,14 @@ func (a *appState) tryClaimInit() bool {
 }
 
 // maybeFastPathInit checks the on-disk roster registry for an existing
-// `director` dispatcher entry and, if found, marks initStatus = ok
-// immediately. Skips the "Setting up Director…" setup page flash that
-// otherwise appears on every relaunch even when the dispatcher has
-// already existed for days. The goroutine running initDirector still
-// runs in the background and will downgrade initStatus to "failed" if
-// the dispatcher's actually broken (e.g. tmux session vanished).
+// `director` dispatcher entry and, if found AND the tmux session is still
+// alive, marks initStatus = ok immediately. Skips the "Setting up Director…"
+// setup page flash that otherwise appears on every relaunch when the
+// dispatcher has already existed for days.
+//
+// If the registry entry exists but the tmux session is dead (e.g. the user
+// quit and relaunched, or the tmux server was restarted), the stale entry is
+// removed so initDirector can spawn a fresh dispatcher.
 func (a *appState) maybeFastPathInit() {
 	a.initMu.Lock()
 	defer a.initMu.Unlock()
@@ -217,9 +219,16 @@ func (a *appState) maybeFastPathInit() {
 		return
 	}
 	registry := filepath.Join(home, ".local", "share", "roster", "agents", "director.json")
-	if _, err := os.Stat(registry); err == nil {
-		a.initStatus = initOK
+	target, ok := registryTarget(registry)
+	if !ok {
+		return // no registry entry — normal first-run path
 	}
+	if tmuxTargetAlive(target) {
+		a.initStatus = initOK
+		return
+	}
+	// Stale entry: session is gone. Remove it so initDirector spawns fresh.
+	_ = os.Remove(registry)
 }
 
 // dispatch routes incoming requests. Setup page when prereqs aren't
@@ -957,15 +966,17 @@ end tell`, esc)
 // Safe to call multiple times: dispatcherExists short-circuits when
 // the agent is already in roster's registry.
 func (a *appState) initDirector() {
-	// Fast path for returning users: if the dispatcher's registry
-	// entry already exists on disk, mark init OK immediately and
-	// skip everything else. Avoids the "Setting up Director…" flash
-	// that otherwise appeared on every relaunch even when the
-	// dispatcher had been live for days.
+	// Fast path for returning users: if the dispatcher's registry entry
+	// exists AND its tmux session is still alive, skip the spawn entirely.
 	if home := os.Getenv("HOME"); home != "" {
-		if _, err := os.Stat(filepath.Join(home, ".local", "share", "roster", "agents", "director.json")); err == nil {
-			a.setInit(initOK, "")
-			return
+		registry := filepath.Join(home, ".local", "share", "roster", "agents", "director.json")
+		if target, ok := registryTarget(registry); ok {
+			if tmuxTargetAlive(target) {
+				a.setInit(initOK, "")
+				return
+			}
+			// Stale entry — remove it so roster can re-spawn cleanly.
+			_ = os.Remove(registry)
 		}
 	}
 	a.setInit(initRunning, "")
@@ -1021,6 +1032,54 @@ func (a *appState) initDirector() {
 	}
 	logSetup("init: dispatcher spawned ok")
 	a.setInit(initOK, "")
+}
+
+// registryTarget reads the roster JSON for the director agent and returns
+// its tmux target (e.g. "director:cc"). Returns ("", false) if the file
+// doesn't exist or can't be parsed.
+func registryTarget(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var entry struct {
+		Target string `json:"target"`
+	}
+	if err := json.Unmarshal(data, &entry); err != nil || entry.Target == "" {
+		return "", false
+	}
+	return entry.Target, true
+}
+
+// tmuxTargetAlive returns true if the given tmux target (session or
+// session:window) currently exists in the running tmux server. Uses
+// `tmux has-session` for sessions and `tmux list-windows` for windows.
+func tmuxTargetAlive(target string) bool {
+	// Split "session:window" into parts.
+	session := target
+	window := ""
+	if i := strings.Index(target, ":"); i >= 0 {
+		session = target[:i]
+		window = target[i+1:]
+	}
+	// Check session first.
+	if err := exec.Command("tmux", "has-session", "-t", session).Run(); err != nil {
+		return false
+	}
+	if window == "" {
+		return true
+	}
+	// Check specific window by name.
+	out, err := exec.Command("tmux", "list-windows", "-t", session, "-F", "#{window_name}").Output()
+	if err != nil {
+		return false
+	}
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if name == window {
+			return true
+		}
+	}
+	return false
 }
 
 // dispatcherExists asks the running fleetview whether any registered
