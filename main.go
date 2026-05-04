@@ -87,7 +87,12 @@ func main() {
 			fmt.Fprintln(os.Stderr, "fleet-app:", err)
 			os.Exit(1)
 		}
-		go app.initDirector()
+		// Same claim-then-launch pattern as the setup poll handler:
+		// we want the eager start to lose to a concurrent setup
+		// poll (or vice versa), not double-fire `roster spawn`.
+		if app.tryClaimInit() {
+			go app.initDirector()
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -171,6 +176,26 @@ func (a *appState) getInit() (status, errMsg string) {
 	a.initMu.RLock()
 	defer a.initMu.RUnlock()
 	return a.initStatus, a.initError
+}
+
+// tryClaimInit atomically transitions initStatus to "running" if it
+// was "" or "failed", and returns true to signal the caller now owns
+// the in-flight init. Without this, the setup page's polling handler
+// could see initStatus == "" twice in a row and fire two
+// `go initDirector()` goroutines — both would race a `roster spawn
+// director`, each creating its own tmux session, and once Claude
+// inside each session loads the dispatcher prompt the fleet
+// multiplies (orchestrators → workers → ...). Always pair this with
+// `if claimed { go a.initDirector() }`.
+func (a *appState) tryClaimInit() bool {
+	a.initMu.Lock()
+	defer a.initMu.Unlock()
+	if a.initStatus == "" || a.initStatus == initFailed {
+		a.initStatus = initRunning
+		a.initError = ""
+		return true
+	}
+	return false
 }
 
 // maybeFastPathInit checks the on-disk roster registry for an existing
@@ -765,10 +790,14 @@ func (a *appState) recheckHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Kick off init if we haven't yet, OR retry if the previous
-		// attempt failed. Don't restart a "running" init — that would
-		// race two `roster spawn`s against the same id.
-		if initStatus == "" || initStatus == initFailed {
+		// attempt failed. The claim is atomic so two concurrent
+		// setup polls can't both fire goroutines and race two
+		// `roster spawn director` calls (the bug behind the
+		// "100s of tmux panes on first launch" report).
+		if a.tryClaimInit() {
 			go a.initDirector()
+			resp.InitStatus = initRunning
+		} else if initStatus == initRunning {
 			resp.InitStatus = initRunning
 		}
 	}
