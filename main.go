@@ -47,6 +47,7 @@ func resolveBackendAddr() string {
 
 func main() {
 	bootstrapPATH()
+	installAmuxShim()
 
 	// `--reset` wipes Director state so first-run can be replayed end
 	// to end. Useful for testing the setup flow without fully nuking
@@ -199,12 +200,14 @@ func (a *appState) tryClaimInit() bool {
 }
 
 // maybeFastPathInit checks the on-disk roster registry for an existing
-// `director` dispatcher entry and, if found, marks initStatus = ok
-// immediately. Skips the "Setting up Director…" setup page flash that
-// otherwise appears on every relaunch even when the dispatcher has
-// already existed for days. The goroutine running initDirector still
-// runs in the background and will downgrade initStatus to "failed" if
-// the dispatcher's actually broken (e.g. tmux session vanished).
+// `director` dispatcher entry and, if found AND the tmux session is still
+// alive, marks initStatus = ok immediately. Skips the "Setting up Director…"
+// setup page flash that otherwise appears on every relaunch when the
+// dispatcher has already existed for days.
+//
+// If the registry entry exists but the tmux session is dead (e.g. the user
+// quit and relaunched, or the tmux server was restarted), the stale entry is
+// removed so initDirector can spawn a fresh dispatcher.
 func (a *appState) maybeFastPathInit() {
 	a.initMu.Lock()
 	defer a.initMu.Unlock()
@@ -216,9 +219,16 @@ func (a *appState) maybeFastPathInit() {
 		return
 	}
 	registry := filepath.Join(home, ".local", "share", "roster", "agents", "director.json")
-	if _, err := os.Stat(registry); err == nil {
-		a.initStatus = initOK
+	target, ok := registryTarget(registry)
+	if !ok {
+		return // no registry entry — normal first-run path
 	}
+	if tmuxTargetAlive(target) {
+		a.initStatus = initOK
+		return
+	}
+	// Stale entry: session is gone. Remove it so initDirector spawns fresh.
+	_ = os.Remove(registry)
 }
 
 // dispatch routes incoming requests. Setup page when prereqs aren't
@@ -549,6 +559,95 @@ func findClaude() string {
 	return ""
 }
 
+// installAmuxShim writes a thin wrapper to ~/.local/bin/amux that fixes a
+// compatibility issue between camux and amux when called as subprocesses.
+//
+// Background: camux calls amux as separate subprocess invocations. amux's
+// "exists" command checks an in-process session registry — that registry is
+// empty in every new subprocess, so "amux exists <target>" always returns
+// false even right after "amux window <target> -- claude ..." succeeds.
+// camux interprets the false return as "the window disappeared" and aborts.
+//
+// The shim redirects "exists" to query the tmux server state directly (which
+// is the source of truth), and passes every other command to the real amux
+// with AMUX_LOOSE_TARGETS=1 so that subsequent wait-for/capture calls skip
+// the same registry check.
+//
+// ~/.local/bin is prepended to PATH by findClaude() when the Anthropic
+// installer is present, so the shim is naturally found before the bundled
+// amux in Director.app/Contents/MacOS.
+func installAmuxShim() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	// Find the real amux — prefer the bundled copy next to this executable.
+	realAmux := ""
+	if exe, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			candidate := filepath.Join(filepath.Dir(real), "amux")
+			if fi, err := os.Stat(candidate); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+				realAmux = candidate
+			}
+		}
+	}
+	if realAmux == "" {
+		if p, err := exec.LookPath("amux"); err == nil {
+			realAmux = p
+		}
+	}
+	if realAmux == "" {
+		return // nothing to wrap
+	}
+
+	shimDir := filepath.Join(home, ".local", "bin")
+	shimPath := filepath.Join(shimDir, "amux")
+
+	// Skip if an up-to-date shim already points at the same real amux.
+	if existing, err := os.ReadFile(shimPath); err == nil {
+		if strings.Contains(string(existing), realAmux) {
+			return
+		}
+	}
+
+	shim := "#!/usr/bin/env bash\n" +
+		"# amux shim installed by Director.app — do not edit by hand.\n" +
+		"# Fixes: amux exists uses in-process registry that is empty in every\n" +
+		"# new subprocess invocation. Redirect to tmux state directly.\n" +
+		"REAL_AMUX=" + shellQuote(realAmux) + "\n" +
+		`case "$1" in
+  exists)
+    TARGET="$2"
+    if [[ "$TARGET" == *:* ]]; then
+      tmux display-message -t "$TARGET" -p '#{window_name}' &>/dev/null
+    else
+      tmux has-session -t "$TARGET" 2>/dev/null
+    fi
+    exit $?
+    ;;
+  *)
+    AMUX_LOOSE_TARGETS=1 exec "$REAL_AMUX" "$@"
+    ;;
+esac
+`
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		return
+	}
+	if err := os.WriteFile(shimPath, []byte(shim), 0o755); err != nil {
+		return
+	}
+	// Ensure shimDir is in PATH ahead of the bundle so the shim wins.
+	current := os.Getenv("PATH")
+	if !strings.Contains(":"+current+":", ":"+shimDir+":") {
+		os.Setenv("PATH", shimDir+":"+current)
+	}
+}
+
+// shellQuote wraps s in single quotes for safe use in a bash script.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // directorAuthConfigured returns true when the user has run
 // `claude setup-token` and pasted the resulting token into Director.
 // The token is the per-machine OAuth credential every spawned orch
@@ -867,15 +966,17 @@ end tell`, esc)
 // Safe to call multiple times: dispatcherExists short-circuits when
 // the agent is already in roster's registry.
 func (a *appState) initDirector() {
-	// Fast path for returning users: if the dispatcher's registry
-	// entry already exists on disk, mark init OK immediately and
-	// skip everything else. Avoids the "Setting up Director…" flash
-	// that otherwise appeared on every relaunch even when the
-	// dispatcher had been live for days.
+	// Fast path for returning users: if the dispatcher's registry entry
+	// exists AND its tmux session is still alive, skip the spawn entirely.
 	if home := os.Getenv("HOME"); home != "" {
-		if _, err := os.Stat(filepath.Join(home, ".local", "share", "roster", "agents", "director.json")); err == nil {
-			a.setInit(initOK, "")
-			return
+		registry := filepath.Join(home, ".local", "share", "roster", "agents", "director.json")
+		if target, ok := registryTarget(registry); ok {
+			if tmuxTargetAlive(target) {
+				a.setInit(initOK, "")
+				return
+			}
+			// Stale entry — remove it so roster can re-spawn cleanly.
+			_ = os.Remove(registry)
 		}
 	}
 	a.setInit(initRunning, "")
@@ -931,6 +1032,54 @@ func (a *appState) initDirector() {
 	}
 	logSetup("init: dispatcher spawned ok")
 	a.setInit(initOK, "")
+}
+
+// registryTarget reads the roster JSON for the director agent and returns
+// its tmux target (e.g. "director:cc"). Returns ("", false) if the file
+// doesn't exist or can't be parsed.
+func registryTarget(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var entry struct {
+		Target string `json:"target"`
+	}
+	if err := json.Unmarshal(data, &entry); err != nil || entry.Target == "" {
+		return "", false
+	}
+	return entry.Target, true
+}
+
+// tmuxTargetAlive returns true if the given tmux target (session or
+// session:window) currently exists in the running tmux server. Uses
+// `tmux has-session` for sessions and `tmux list-windows` for windows.
+func tmuxTargetAlive(target string) bool {
+	// Split "session:window" into parts.
+	session := target
+	window := ""
+	if i := strings.Index(target, ":"); i >= 0 {
+		session = target[:i]
+		window = target[i+1:]
+	}
+	// Check session first.
+	if err := exec.Command("tmux", "has-session", "-t", session).Run(); err != nil {
+		return false
+	}
+	if window == "" {
+		return true
+	}
+	// Check specific window by name.
+	out, err := exec.Command("tmux", "list-windows", "-t", session, "-F", "#{window_name}").Output()
+	if err != nil {
+		return false
+	}
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if name == window {
+			return true
+		}
+	}
+	return false
 }
 
 // dispatcherExists asks the running fleetview whether any registered
