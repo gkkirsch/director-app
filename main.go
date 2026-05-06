@@ -13,14 +13,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/menu"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/mac"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // Wails wants an embedded asset FS even though we never use it — the
@@ -47,6 +51,7 @@ func resolveBackendAddr() string {
 
 func main() {
 	bootstrapPATH()
+	relinkBundledBinaries()
 
 	// `--reset` wipes Director state so first-run can be replayed end
 	// to end. Useful for testing the setup flow without fully nuking
@@ -115,6 +120,13 @@ func main() {
 			// doesn't intercept "/" → embedded index.html.
 			Handler: mux,
 		},
+		Menu: buildAppMenu(app),
+		OnStartup: func(ctx context.Context) {
+			// Stash the Wails ctx so menu callbacks can show confirmation
+			// dialogs (runtime.MessageDialog needs the ctx) and call
+			// runtime.Quit when a destructive cleanup completes.
+			app.setWailsCtx(ctx)
+		},
 		BackgroundColour: &options.RGBA{R: 245, G: 239, B: 230, A: 1}, // linen
 		Mac: &mac.Options{
 			// FullSizeContent extends the webview under the title
@@ -157,6 +169,23 @@ type appState struct {
 	initMu     sync.RWMutex
 	initStatus string // "", "running", "ok", "failed"
 	initError  string
+
+	// wailsCtx is captured in OnStartup so menu callbacks can show
+	// dialogs and quit. Read via wailsContext(); never use directly.
+	ctxMu    sync.RWMutex
+	wailsCtx context.Context
+}
+
+func (a *appState) setWailsCtx(ctx context.Context) {
+	a.ctxMu.Lock()
+	a.wailsCtx = ctx
+	a.ctxMu.Unlock()
+}
+
+func (a *appState) wailsContext() context.Context {
+	a.ctxMu.RLock()
+	defer a.ctxMu.RUnlock()
+	return a.wailsCtx
 }
 
 const (
@@ -1002,6 +1031,223 @@ func resetDirectorState() error {
 		_ = exec.Command("amux", "kill", id).Run()
 	}
 	return nil
+}
+
+// wipeAllDirectorData nukes everything Director writes to disk:
+// every orchestrator and worker, every artifact, every browser
+// profile, every cached webview state, every stale CLI shim. Used
+// by the "Wipe All Director Data" menu item when the user wants a
+// clean-room state to test first-run setup against (the manual
+// recipe is in the dogfood skill — this just lifts it into the
+// app and adds the bits the manual recipe forgets).
+//
+// Does NOT remove /Applications/Director.app — that would break
+// the running process and leave the user without a path to
+// relaunch. A full uninstall stays a CLI-only operation.
+func wipeAllDirectorData() error {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return fmt.Errorf("HOME not set")
+	}
+
+	// 1. Kill every tmux session that has a roster registry entry.
+	//    We enumerate registry IDs (not `tmux list-sessions`) so we
+	//    only touch sessions Director created — the user's main shell
+	//    and unrelated projects stay alive.
+	agentsDir := filepath.Join(home, ".local", "share", "roster", "agents")
+	if entries, err := os.ReadDir(agentsDir); err == nil {
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			id := strings.TrimSuffix(e.Name(), ".json")
+			_ = exec.Command("amux", "kill", id).Run()
+		}
+	}
+
+	// 2. SIGTERM agent-browser daemons via their pidfiles BEFORE
+	//    deleting ~/.agent-browser. Removing the dir without this
+	//    orphans the daemon process, which then keeps writing to
+	//    stale paths and can confuse the next launch.
+	browserDir := filepath.Join(home, ".agent-browser")
+	if entries, err := os.ReadDir(browserDir); err == nil {
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".pid") {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(browserDir, e.Name()))
+			if err != nil {
+				continue
+			}
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGTERM)
+			}
+		}
+	}
+
+	// 3. Kill any per-orch Chrome processes (chrome processes whose
+	//    --user-data-dir lands inside roster/browser-profiles). These
+	//    are spawned by `roster browser launch <orch>` and won't
+	//    notice their profile dir vanishing — better to terminate
+	//    them cleanly first.
+	_ = exec.Command("pkill", "-f", "roster/browser-profiles").Run()
+
+	// 4. Nuke the data dirs.
+	for _, p := range []string{
+		filepath.Join(home, "Library", "Application Support", "Director"),
+		filepath.Join(home, ".local", "share", "roster"),
+		filepath.Join(home, ".agent-browser"),
+		// Wails' WKWebView caches and saved-state under our bundle id.
+		filepath.Join(home, "Library", "Caches", "com.wails.Director"),
+		filepath.Join(home, "Library", "WebKit", "com.wails.Director"),
+		filepath.Join(home, "Library", "Saved Application State", "com.wails.Director.savedState"),
+	} {
+		if err := os.RemoveAll(p); err != nil {
+			return fmt.Errorf("rm %s: %w", p, err)
+		}
+	}
+
+	// 5. Remove the user-PATH shims so terminal usage matches whatever
+	//    Director.app version is installed next time. They get re-linked
+	//    on the next launch by relinkBundledBinaries().
+	for _, n := range []string{"roster", "camux", "amux", "director-server", "agent-browser"} {
+		_ = os.Remove(filepath.Join(home, ".local", "bin", n))
+	}
+	return nil
+}
+
+// relinkBundledBinaries refreshes ~/.local/bin/<tool> to point at
+// the bundled binaries inside this Director.app. Without this, a
+// user who once installed roster/camux/etc. via curl-pipe-bash gets
+// stuck with stale binaries on their terminal PATH forever — the
+// app subprocesses themselves are fine (bootstrapPATH wins inside
+// the bundle) but `roster tree` from a shell silently runs old
+// code. Rerunning every launch is cheap (an lstat + a symlink) and
+// guarantees the CLI matches whatever's installed.
+//
+// Skipped during wails-build introspection runs — we never want to
+// touch ~/.local/bin from a binary that's about to be SIGKILLed.
+func relinkBundledBinaries() {
+	if os.Getenv("WAILS_BUILDING") == "1" || strings.Contains(os.Args[0], "/build/") {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	real, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return
+	}
+	bundleDir := filepath.Dir(real) // .../Director.app/Contents/MacOS
+	binDir := filepath.Join(os.Getenv("HOME"), ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return
+	}
+	for _, n := range []string{"roster", "camux", "amux", "director-server"} {
+		src := filepath.Join(bundleDir, n)
+		if fi, err := os.Stat(src); err != nil || fi.IsDir() {
+			continue
+		}
+		dst := filepath.Join(binDir, n)
+		// Skip if already pointing at the right target — avoids a
+		// log-noisy unlink/symlink dance on every launch.
+		if cur, err := os.Readlink(dst); err == nil && cur == src {
+			continue
+		}
+		_ = os.Remove(dst)
+		_ = os.Symlink(src, dst)
+	}
+}
+
+// buildAppMenu wires the macOS menu bar. We add a single "Tools"
+// menu next to the standard App / Edit / Window menus so cleanup
+// items live somewhere obvious without overriding any built-in
+// menu (Wails' AppMenu role is opaque — we can't insert items
+// inside the Director menu itself).
+func buildAppMenu(app *appState) *menu.Menu {
+	tools := &menu.Menu{}
+	tools.AddText("Reset Dispatcher…", nil, func(_ *menu.CallbackData) {
+		go runCleanupAction(app, cleanupReset)
+	})
+	tools.AddText("Wipe All Director Data…", nil, func(_ *menu.CallbackData) {
+		go runCleanupAction(app, cleanupWipe)
+	})
+
+	return menu.NewMenuFromItems(
+		menu.AppMenu(),
+		&menu.MenuItem{Type: menu.SubmenuType, Label: "Tools", SubMenu: tools},
+		menu.EditMenu(),
+		menu.WindowMenu(),
+	)
+}
+
+type cleanupKind int
+
+const (
+	cleanupReset cleanupKind = iota
+	cleanupWipe
+)
+
+// runCleanupAction is the shared confirm → cleanup → quit flow for
+// menu-driven destructive actions. Runs on its own goroutine so the
+// blocking dialog calls don't hold up the menu thread. After a
+// successful cleanup the app quits — the user relaunches to replay
+// first-run setup against a clean slate. We don't auto-relaunch
+// because spawning a new instance from a quitting one is fragile
+// on macOS (the new launch can race the old one's port release).
+func runCleanupAction(app *appState, kind cleanupKind) {
+	ctx := app.wailsContext()
+	if ctx == nil {
+		return // menu fired before OnStartup somehow; nothing safe to do
+	}
+
+	var title, message, doneMsg string
+	var run func() error
+	switch kind {
+	case cleanupReset:
+		title = "Reset Dispatcher?"
+		message = "Wipes the Director dispatcher's state (registry entry, claude config, tmux session, setup log) so first-run setup can replay. Other orchestrators and their work are preserved."
+		doneMsg = "Director dispatcher reset. The app will now quit; relaunch to replay first-run setup."
+		run = resetDirectorState
+	case cleanupWipe:
+		title = "Wipe ALL Director Data?"
+		message = "Removes every orchestrator and worker, every artifact under ~/Library/Application Support/Director, every per-orch claude config and browser profile. This cannot be undone. The Director app itself stays installed."
+		doneMsg = "All Director data wiped. The app will now quit; relaunch to start fresh."
+		run = wipeAllDirectorData
+	}
+
+	choice, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{
+		Type:          wailsruntime.QuestionDialog,
+		Title:         title,
+		Message:       message,
+		Buttons:       []string{"Cancel", "Continue"},
+		DefaultButton: "Cancel",
+		CancelButton:  "Cancel",
+	})
+	if err != nil || choice != "Continue" {
+		return
+	}
+
+	// Stop our director-server child before mutating its data dirs so
+	// it doesn't race writes against the wipe.
+	app.shutdown()
+
+	if err := run(); err != nil {
+		_, _ = wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{
+			Type:    wailsruntime.ErrorDialog,
+			Title:   "Cleanup failed",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	_, _ = wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{
+		Type:    wailsruntime.InfoDialog,
+		Title:   "Done",
+		Message: doneMsg,
+	})
+	wailsruntime.Quit(ctx)
 }
 
 // setupHandler renders the setup page. We seed it with the current
