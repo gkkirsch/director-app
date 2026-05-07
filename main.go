@@ -166,9 +166,10 @@ type appState struct {
 	ready bool
 	proxy *httputil.ReverseProxy
 
-	initMu     sync.RWMutex
-	initStatus string // "", "running", "ok", "failed"
-	initError  string
+	initMu        sync.RWMutex
+	initStatus    string // "", "running", "ok", "failed"
+	initError     string
+	initFailCount int // consecutive init failures; reset on success
 
 	// wailsCtx is captured in OnStartup so menu callbacks can show
 	// dialogs and quit. Read via wailsContext(); never use directly.
@@ -198,7 +199,22 @@ func (a *appState) setInit(status, errMsg string) {
 	a.initMu.Lock()
 	a.initStatus = status
 	a.initError = errMsg
+	switch status {
+	case initFailed:
+		a.initFailCount++
+	case initOK:
+		a.initFailCount = 0
+	}
 	a.initMu.Unlock()
+}
+
+// initFailures returns the count of consecutive init failures since
+// the last success. Used by initDirector to decide whether to nuke
+// the dispatcher state before a retry.
+func (a *appState) initFailures() int {
+	a.initMu.RLock()
+	defer a.initMu.RUnlock()
+	return a.initFailCount
 }
 
 func (a *appState) getInit() (status, errMsg string) {
@@ -908,7 +924,24 @@ func (a *appState) initDirector() {
 		}
 	}
 	a.setInit(initRunning, "")
-	logSetup("init: starting")
+	failures := a.initFailures()
+	logSetup(fmt.Sprintf("init: starting (consecutive failures so far: %d)", failures))
+
+	// Self-heal: if we've failed ≥3 times in a row, the dispatcher's
+	// state is probably wedged in some way the per-attempt fixes
+	// can't unwind (orphan tmux window our probe can't see, partial
+	// claude config, missing registry entry pointing at a stale
+	// session). Nuke just the dispatcher's state — preserves every
+	// other orchestrator and their work — and let the next spawn
+	// start from a clean slate. Without this, the loop is stuck.
+	if failures >= 3 {
+		logSetup("init: 3+ consecutive failures, running resetDirectorState() to self-heal")
+		if err := resetDirectorState(); err != nil {
+			logSetup("init: self-heal reset failed: " + err.Error())
+		} else {
+			logSetup("init: self-heal reset ok")
+		}
+	}
 
 	// Wait up to 5s for director-server to bind its port before probing
 	// /api/fleet. startDirectorServer already polls but a slow box could
