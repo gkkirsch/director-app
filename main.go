@@ -166,10 +166,9 @@ type appState struct {
 	ready bool
 	proxy *httputil.ReverseProxy
 
-	initMu        sync.RWMutex
-	initStatus    string // "", "running", "ok", "failed"
-	initError     string
-	initFailCount int // consecutive init failures; reset on success
+	initMu     sync.RWMutex
+	initStatus string // "", "running", "ok", "failed"
+	initError  string
 
 	// wailsCtx is captured in OnStartup so menu callbacks can show
 	// dialogs and quit. Read via wailsContext(); never use directly.
@@ -199,22 +198,7 @@ func (a *appState) setInit(status, errMsg string) {
 	a.initMu.Lock()
 	a.initStatus = status
 	a.initError = errMsg
-	switch status {
-	case initFailed:
-		a.initFailCount++
-	case initOK:
-		a.initFailCount = 0
-	}
 	a.initMu.Unlock()
-}
-
-// initFailures returns the count of consecutive init failures since
-// the last success. Used by initDirector to decide whether to nuke
-// the dispatcher state before a retry.
-func (a *appState) initFailures() int {
-	a.initMu.RLock()
-	defer a.initMu.RUnlock()
-	return a.initFailCount
 }
 
 func (a *appState) getInit() (status, errMsg string) {
@@ -904,68 +888,17 @@ end tell`, esc)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// initDirector ensures the "director" dispatcher exists. Updates
-// a.initStatus (running → ok|failed) so the setup page can show
-// progress and surface real errors. Captures stderr from `roster
-// spawn` and appends to setup.log for post-mortem.
+// initDirector makes the "director" dispatcher's tmux target live.
+// First launch on a machine: `roster spawn director` (full registration).
+// Every relaunch after: `roster ensure director` (idempotent, fast when
+// the dispatcher is already ready).
 //
-// Safe to call multiple times: dispatcherExists short-circuits when
-// the agent is already in roster's registry.
+// Recovery is roster's job, not ours: if the tmux session was killed,
+// the agent's claude crashed, or the user rebooted, ensure handles it.
 func (a *appState) initDirector() {
-	// Fast path for returning users: if the dispatcher's registry
-	// entry already exists on disk, mark init OK immediately and
-	// skip everything else. Avoids the "Setting up Director…" flash
-	// that otherwise appeared on every relaunch even when the
-	// dispatcher had been live for days.
-	if home := os.Getenv("HOME"); home != "" {
-		if _, err := os.Stat(filepath.Join(home, ".local", "share", "roster", "agents", "director.json")); err == nil {
-			a.setInit(initOK, "")
-			return
-		}
-	}
 	a.setInit(initRunning, "")
-	failures := a.initFailures()
-	logSetup(fmt.Sprintf("init: starting (consecutive failures so far: %d)", failures))
+	logSetup("init: starting")
 
-	// Self-heal: if we've failed ≥3 times in a row, the dispatcher's
-	// state is probably wedged in some way the per-attempt fixes
-	// can't unwind (orphan tmux window our probe can't see, partial
-	// claude config, missing registry entry pointing at a stale
-	// session). Nuke just the dispatcher's state — preserves every
-	// other orchestrator and their work — and let the next spawn
-	// start from a clean slate. Without this, the loop is stuck.
-	if failures >= 3 {
-		logSetup("init: 3+ consecutive failures, running resetDirectorState() to self-heal")
-		if err := resetDirectorState(); err != nil {
-			logSetup("init: self-heal reset failed: " + err.Error())
-		} else {
-			logSetup("init: self-heal reset ok")
-		}
-	}
-
-	// Wait up to 5s for director-server to bind its port before probing
-	// /api/fleet. startDirectorServer already polls but a slow box could
-	// race the goroutine that called us.
-	for i := 0; i < 50 && !portAlive(backendAddr); i++ {
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !portAlive(backendAddr) {
-		msg := "fleetview backend never came up on " + backendAddr
-		logSetup("init failed: " + msg)
-		a.setInit(initFailed, msg)
-		return
-	}
-
-	if dispatcherExists() {
-		logSetup("init: dispatcher already exists")
-		a.setInit(initOK, "")
-		return
-	}
-
-	cmd := exec.Command("roster", "spawn", "director",
-		"--kind", "dispatcher",
-		"--display-name", "Director",
-		"--description", "routes user requests")
 	// Anchor at the data dir so the dispatcher's recorded cwd isn't '/'
 	// (Finder/Dock launches inherit '/'). Every agent the dispatcher
 	// later spawns inherits this in turn via the parent's cwd at
@@ -977,35 +910,52 @@ func (a *appState) initDirector() {
 		a.setInit(initFailed, msg)
 		return
 	}
-	cmd.Dir = dir
+
+	if err := ensureDispatcher(dir); err != nil {
+		logSetup("init failed: " + err.Error())
+		a.setInit(initFailed, err.Error())
+		return
+	}
+	logSetup("init: dispatcher live")
+	a.setInit(initOK, "")
+}
+
+// ensureDispatcher idempotently makes the "director" dispatcher's tmux
+// target live. Routes by registry-file presence (not /api/fleet) so this
+// works even before director-server has bound its port — startup races
+// where fleetview is still warming up don't make us miss the right path.
+func ensureDispatcher(workDir string) error {
+	args := []string{"ensure", "director"}
+	if !dispatcherRegistered() {
+		args = []string{
+			"spawn", "director",
+			"--kind", "dispatcher",
+			"--display-name", "Director",
+			"--description", "routes user requests",
+		}
+	}
+	cmd := exec.Command("roster", args...)
+	cmd.Dir = workDir
 	var combined bytes.Buffer
 	cmd.Stdout = io.MultiWriter(&combined, os.Stderr)
 	cmd.Stderr = io.MultiWriter(&combined, os.Stderr)
 	if err := cmd.Run(); err != nil {
-		out := strings.TrimSpace(combined.String())
-		msg := out
+		msg := strings.TrimSpace(combined.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		logSetup("init failed: roster spawn exited: " + msg)
-		a.setInit(initFailed, msg)
-		return
+		return fmt.Errorf("roster %s: %s", strings.Join(args, " "), msg)
 	}
-	logSetup("init: dispatcher spawned ok")
-	a.setInit(initOK, "")
+	return nil
 }
 
-// dispatcherExists asks the running fleetview whether any registered
-// agent is a dispatcher. Cheap; we use it both as the idempotency
-// check before spawning and as the heal signal on subsequent launches.
-func dispatcherExists() bool {
-	resp, err := http.Get(backendURL + "/api/fleet")
-	if err != nil || resp == nil {
+func dispatcherRegistered() bool {
+	home := os.Getenv("HOME")
+	if home == "" {
 		return false
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return bytes.Contains(body, []byte(`"kind":"dispatcher"`))
+	_, err := os.Stat(filepath.Join(home, ".local", "share", "roster", "agents", "director.json"))
+	return err == nil
 }
 
 // logSetup appends a timestamped line to setup.log in the Director
