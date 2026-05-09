@@ -99,9 +99,10 @@ done
 APP="build/bin/Director.app"
 MACOS="$APP/Contents/MacOS"
 
-for bin in "$DIRECTOR_SERVER" "$ROSTER" "$CAMUX" "$AMUX"; do
-  install -m 0755 "$bin" "$MACOS/$(basename "$bin")"
-done
+install -m 0755 "$DIRECTOR_SERVER" "$MACOS/director-server"
+install -m 0755 "$ROSTER"          "$MACOS/roster"
+install -m 0755 "$CAMUX"           "$MACOS/camux"
+install -m 0755 "$AMUX"            "$MACOS/amux"
 
 # Re-sign so the codesign seal includes the new siblings. ad-hoc is
 # fine for local distribution — public release will swap in a Dev ID.
