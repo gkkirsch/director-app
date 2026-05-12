@@ -106,6 +106,8 @@ func main() {
 	mux.HandleFunc("/__setup/run", runInTerminalHandler)
 	mux.HandleFunc("/__setup/auth-token", authTokenHandler)
 	mux.HandleFunc("/__setup/sniff-token", sniffTokenHandler)
+	mux.HandleFunc("/__setup/retry", app.retryHandler)
+	mux.HandleFunc("/__setup/reset-dispatcher", app.resetDispatcherHandler)
 	mux.HandleFunc("/", app.dispatch)
 
 	err := wails.Run(&options.App{
@@ -208,23 +210,41 @@ func (a *appState) getInit() (status, errMsg string) {
 }
 
 // tryClaimInit atomically transitions initStatus to "running" if it
-// was "" or "failed", and returns true to signal the caller now owns
-// the in-flight init. Without this, the setup page's polling handler
-// could see initStatus == "" twice in a row and fire two
-// `go initDirector()` goroutines — both would race a `roster spawn
-// director`, each creating its own tmux session, and once Claude
-// inside each session loads the dispatcher prompt the fleet
-// multiplies (orchestrators → workers → ...). Always pair this with
-// `if claimed { go a.initDirector() }`.
+// was "" (never attempted), and returns true to signal the caller now
+// owns the in-flight init.
+//
+// Critical: we do NOT auto-claim from initFailed. The setup page polls
+// /__setup/recheck every 1.5s; if claim succeeded on failed-state, every
+// poll would fire a fresh `go initDirector()` and the spinner would loop
+// forever without surfacing the error. Once init has failed, the user
+// must explicitly retry — `retryInit` below resets status to "" and
+// then the next poll fires a fresh attempt. Without this, a permanent
+// failure (e.g., stale tmux session that ensure can't reconcile) ate
+// the UI: the user saw "Setting up Director…" indefinitely instead of
+// the actual error.
+//
+// Concurrency: paired-call rule remains `if claimed { go a.initDirector() }`
+// — two pollers can't both win the claim, so no fleet-multiplication race.
 func (a *appState) tryClaimInit() bool {
 	a.initMu.Lock()
 	defer a.initMu.Unlock()
-	if a.initStatus == "" || a.initStatus == initFailed {
+	if a.initStatus == "" {
 		a.initStatus = initRunning
 		a.initError = ""
 		return true
 	}
 	return false
+}
+
+// retryInit resets initStatus to "" so the next /__setup/recheck poll
+// claims a fresh init goroutine. Called from the Retry button on the
+// setup page's failure card, and from the Reset Dispatcher button after
+// the underlying state has been cleared.
+func (a *appState) retryInit() {
+	a.initMu.Lock()
+	defer a.initMu.Unlock()
+	a.initStatus = ""
+	a.initError = ""
 }
 
 // maybeFastPathInit checks the on-disk roster registry for an existing
@@ -838,6 +858,58 @@ func (a *appState) recheckHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// retryHandler resets initStatus to "" so the next /__setup/recheck poll
+// will fire a fresh init goroutine. Called by the "Retry setup" button
+// on the setup page's failure card. Always answers 204 — there's no
+// data to return; the page recheckes immediately afterwards.
+func (a *appState) retryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	a.retryInit()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// resetDispatcherHandler proxies POST /api/dispatcher/reset to the
+// director-server (which forgets the dispatcher record and kills its
+// tmux session), then clears local initStatus so the next recheck
+// fires a clean ensure → spawn. The "Reset Dispatcher" button on the
+// setup page calls this when init has been failing repeatedly. The
+// scope deliberately matches `Director --reset`: only the dispatcher
+// is touched; other orchs and the user's artifacts are untouched.
+//
+// Best-effort: if director-server isn't reachable, we still clear the
+// local init flag and let the next poll try again. The user sees
+// success-ish behavior either way — much better than a stuck spinner.
+func (a *appState) resetDispatcherHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	resetErr := ""
+	req, _ := http.NewRequest(http.MethodPost, backendURL+"/api/dispatcher/reset", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		resetErr = err.Error()
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			resetErr = strings.TrimSpace(string(body))
+			if resetErr == "" {
+				resetErr = "HTTP " + resp.Status
+			}
+		}
+	}
+	a.retryInit()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":    resetErr == "",
+		"error": resetErr,
+	})
+}
+
 // runInTerminalHandler asks Terminal.app to open a new window and run
 // the supplied command. The command is whitelisted to the install
 // strings we render on the setup page so a hostile fetch can't run
@@ -1291,7 +1363,9 @@ button{background:var(--ink);color:var(--linen);border:0;border-radius:7px;
   padding:7px 12px;font:600 11px/1 -apple-system,sans-serif;letter-spacing:.06em;
   text-transform:uppercase;cursor:pointer;white-space:nowrap}
 button.ghost{background:transparent;color:var(--ink);border:1px solid var(--rule)}
+button.secondary{background:transparent;color:var(--ink);border:1px solid var(--rule)}
 button:hover{opacity:.92}
+button:disabled{opacity:.5;cursor:not-allowed}
 .note{margin-top:8px;color:var(--muted);font-size:11.5px;line-height:1.5}
 .footer{margin-top:18px;display:flex;justify-content:space-between;align-items:center;gap:12px}
 .status{color:var(--muted);font-size:12.5px}
@@ -1443,10 +1517,13 @@ function render(state){
       card.innerHTML = ` + "`" + `
         <div class="row"><div>
           <div class="label">Setup failed</div>
-          <div class="why">Director couldn't spawn its dispatcher. Most often this is a Claude Code login issue or a network blip during plugin install.</div>
+          <div class="why">Director couldn't bring up its dispatcher. The error below is the raw output from <code>roster ensure director</code>.</div>
         </div></div>
         <pre class="errbox">${escapeHTML(initError || 'unknown error')}</pre>
-        <div class="fix"><button id="retry">Retry setup</button></div>
+        <div class="fix">
+          <button id="retry">Retry setup</button>
+          <button id="reset-dispatcher" class="secondary" title="Forget the dispatcher and spawn a fresh one. Other orchs are not affected.">Reset Dispatcher</button>
+        </div>
         <div class="note">Full log at <code>~/Library/Application Support/Director/setup.log</code></div>
       ` + "`" + `;
     } else {
@@ -1459,7 +1536,25 @@ function render(state){
     }
     list.appendChild(card);
     const retry = document.getElementById('retry');
-    if (retry) retry.addEventListener('click', () => recheck());
+    if (retry) retry.addEventListener('click', async () => {
+      // Clear server-side initFailed so the next recheck claims a fresh
+      // init goroutine. Without this, recheck would see initStatus ===
+      // 'failed' and just re-render the same error.
+      await fetch('/__setup/retry', { method: 'POST' });
+      recheck();
+    });
+    const reset = document.getElementById('reset-dispatcher');
+    if (reset) reset.addEventListener('click', async () => {
+      if (busy) return;
+      busy = true;
+      reset.disabled = true; reset.textContent = 'Resetting…';
+      try {
+        await fetch('/__setup/reset-dispatcher', { method: 'POST' });
+      } finally {
+        busy = false;
+        recheck();
+      }
+    });
     if (initStatus !== 'failed') startPolling();
   }
 }
